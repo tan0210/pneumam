@@ -2,7 +2,7 @@ import torch
 import triton
 from triton import language as tl
 
-from .common import _check, tuned_rows
+from .common import tuned_rows
 
 _ROW_CONFIGS = [triton.Config({}, num_warps=nw) for nw in (4, 8, 16)]
 
@@ -335,9 +335,8 @@ def residual_adaln(
         ``(h, z)``: ``z = residual + gate * x`` and ``h = adaln(z, shift, scale)``.
 
     Raises:
-        ValueError: If a tensor is not on CUDA or ``x`` and ``residual`` differ in shape or dtype.
+        ValueError: If ``x`` and ``residual`` differ in shape or dtype.
     """
-    _check(x, residual, gate, shift, scale)
     if x.shape != residual.shape or x.dtype != residual.dtype:
         raise ValueError("x and residual must match")
     return _residual_adaln(
@@ -363,9 +362,5 @@ def adaln(
 
     Returns:
         Tensor with the shape and dtype of ``z``.
-
-    Raises:
-        ValueError: If a tensor is not on CUDA.
     """
-    _check(z, shift, scale)
     return _adaln(z.contiguous(), shift.contiguous(), scale.contiguous(), eps)

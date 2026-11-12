@@ -1,4 +1,5 @@
 import json
+import math
 import os
 
 import torch
@@ -249,6 +250,21 @@ def _to_fp8(x: torch.Tensor, rescale: bool) -> tuple[torch.Tensor, torch.Tensor 
     return (x / s[:, None, :, None]).to(FP8), s
 
 
+def _launch_attention(q8, k8, v8, qs, ks, vs, seqused_k=None, softmax_scale=None):
+    out = torch.empty(q8.shape, dtype=torch.bfloat16, device=q8.device)
+    # warpy wants heads before the sequence and accepts strided views
+    args = (q8.transpose(1, 2), k8.transpose(1, 2), v8.transpose(1, 2), qs, ks, vs)
+    _, lse, _ = _wk.attn_fwd(  # type: ignore
+        *args,
+        softmax_scale=softmax_scale,
+        out=out.transpose(1, 2),
+        return_lse=seqused_k is not None,
+        seqused_k=seqused_k,
+        lse_natural=True,
+    )
+    return out, lse
+
+
 def _attend(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -257,22 +273,29 @@ def _attend(
     seqused_k: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     (q8, qs), (k8, ks), (v8, vs) = (_to_fp8(t, rescale) for t in (q, k, v))
-    out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
-    _, lse, _ = _wk.attn_fwd(  # type: ignore
-        q8.transpose(
-            1, 2
-        ),  # warpy wants heads before the sequence and accepts strided views
-        k8.transpose(1, 2),
-        v8.transpose(1, 2),
-        qs,
-        ks,
-        vs,
-        out=out.transpose(1, 2),
-        return_lse=seqused_k is not None,
-        seqused_k=seqused_k,
-        lse_natural=True,
-    )
-    return out, lse
+    return _launch_attention(q8, k8, v8, qs, ks, vs, seqused_k)
+
+
+def _attend_quantized(q, k, v, qk_scale, v_scale, seqused_k=None):
+    vs = None
+    if v_scale != 1.0:
+        vs = torch.full((q.shape[0], q.shape[2]), 1.0 / v_scale, device=q.device)
+    softmax_scale = 1.0 / (
+        math.sqrt(q.shape[-1]) * qk_scale
+    )  # undoes the Q and K scales
+    return _launch_attention(q, k, v, None, None, vs, seqused_k, softmax_scale)
+
+
+@torch.library.custom_op("pneumam::attention_quantized_warpy", mutates_args=())
+def _attention_quantized(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, qk_scale: float, v_scale: float
+) -> torch.Tensor:
+    return _attend_quantized(q, k, v, qk_scale, v_scale)[0]
+
+
+@_attention_quantized.register_fake
+def _(q, k, v, qk_scale, v_scale):
+    return torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
 
 
 @torch.library.custom_op("pneumam::attention_warpy", mutates_args=())
@@ -323,6 +346,81 @@ def attention(
         Attention output, bfloat16, shape ``[B, Sq, H, hd]``.
     """
     return _attention(q, k, v, rescale)
+
+
+def attention_quantized(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_scale: float = 1.0,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+) -> torch.Tensor:
+    """Full, non-causal multi-head attention on operands that are already FP8. Forward only.
+
+    Args:
+        q: FP8 queries accepted by ``fits_attention``, holding the true queries times
+            ``q_scale``, shape ``[B, Sq, H, hd]``.
+        k: FP8 keys times ``k_scale``, shape ``[B, Sk, H, hd]``.
+        v: FP8 values times ``v_scale``, shape ``[B, Sk, H, hd]``.
+        q_scale: Factor the queries were multiplied by before quantizing.
+        k_scale: Factor the keys were multiplied by before quantizing.
+        v_scale: Factor the values were multiplied by before quantizing.
+
+    Returns:
+        Attention output in true units, bfloat16, shape ``[B, Sq, H, hd]``.
+    """
+    return _attention_quantized(q, k, v, q_scale * k_scale, v_scale)
+
+
+@torch.library.custom_op("pneumam::attention_trimmed_quantized_warpy", mutates_args=())
+def _attention_trimmed_quantized(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seqused_k: torch.Tensor,
+    qk_scale: float,
+    v_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out, lse = _attend_quantized(q, k, v, qk_scale, v_scale, seqused_k)
+    return out, lse.contiguous()
+
+
+@_attention_trimmed_quantized.register_fake
+def _(q, k, v, seqused_k, qk_scale, v_scale):
+    return torch.empty(q.shape, dtype=torch.bfloat16, device=q.device), torch.empty(
+        (q.shape[0], q.shape[2], q.shape[1]), dtype=torch.float32, device=q.device
+    )
+
+
+def attention_trimmed_quantized(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seqused_k: torch.Tensor,
+    q_scale: float = 1.0,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``attention_quantized`` over the first ``seqused_k[b]`` keys of each batch item.
+
+    Forward only.
+
+    Args:
+        q: FP8 queries accepted by ``fits_attention``, holding the true queries times
+            ``q_scale``, shape ``[B, Sq, H, hd]``.
+        k: FP8 keys times ``k_scale``, shape ``[B, Sk, H, hd]``.
+        v: FP8 values times ``v_scale``, shape ``[B, Sk, H, hd]``.
+        seqused_k: Valid key count per batch item, int32, shape ``[B]``.
+        q_scale: Factor the queries were multiplied by before quantizing.
+        k_scale: Factor the keys were multiplied by before quantizing.
+        v_scale: Factor the values were multiplied by before quantizing.
+
+    Returns:
+        ``(out, lse)``: the bfloat16 output in true units ``[B, Sq, H, hd]`` and the float32
+        natural-log softmax normalizer of the true logits ``[B, H, Sq]``. See ``ctx_scale``.
+    """
+    return _attention_trimmed_quantized(q, k, v, seqused_k, q_scale * k_scale, v_scale)
 
 
 def attention_trimmed(
