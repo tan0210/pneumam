@@ -1,0 +1,67 @@
+[project]
+name = "pneumam"
+version = "0.1.0"
+description = "Pneumam"
+readme = "README.md"
+authors = [
+    { name = "Tan", email = "173550691+tan0210@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.14.1",
+    "numpy>=2.0",
+    "safetensors>=0.5",
+]
+
+[project.optional-dependencies]
+triton = [
+    "triton>=3.3; sys_platform == 'linux'",
+    "triton-windows>=3.3; sys_platform == 'win32'",
+]
+sm90 = [
+    "pneumam[triton]",
+    "quack-kernels[cu13]; sys_platform == 'linux'",
+    "flash-attn-4>=4.0.0b38; sys_platform == 'linux'",
+]
+sm120 = [
+    "pneumam[triton]",
+    "warpy-kernels; sys_platform == 'linux'",
+]
+vae = [
+    "ffpa-attn>=0.2.1; sys_platform == 'linux'",
+]
+text = [
+    "transformers>=5.22.1",
+    "sentencepiece>=0.2.3",
+]
+convert = [
+    "pneumam[text]",
+    "diffusers>=0.42.1",
+    "accelerate>=1.15.0",
+]
+hub = ["huggingface-hub>=1.0"]
+cli = ["pillow>=12.0"]
+train = ["tqdm>=4.66"]
+bench = ["matplotlib>=3.9"]
+
+[dependency-groups]
+dev = ["pytest>=8.3", "ruff>=0.12"]
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""
+
+[tool.uv]
+environments = ["sys_platform == 'linux'", "sys_platform == 'win32'"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+warpy-kernels = { git = "https://github.com/tan0210/warpy-kernels" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
