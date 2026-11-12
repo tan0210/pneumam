@@ -3,7 +3,6 @@ import triton
 from triton import language as tl
 
 from .._fp8 import FP8, FP8Weight, quantize_weight  # noqa: F401
-from .common import _check
 
 _ROW_CONFIGS = [triton.Config({}, num_warps=nw) for nw in (4, 8, 16)]
 
@@ -150,9 +149,8 @@ def residual_adaln_fp8(
         updated residual stream ``z`` ``[B, S, D]`` in the input dtype.
 
     Raises:
-        ValueError: If a tensor is not on CUDA or ``x`` and ``residual`` differ in shape or dtype.
+        ValueError: If ``x`` and ``residual`` differ in shape or dtype.
     """
-    _check(x, residual, gate, shift, scale)
     if x.shape != residual.shape or x.dtype != residual.dtype:
         raise ValueError("x and residual must match")
     return _residual_adaln_fp8(
@@ -178,11 +176,7 @@ def adaln_fp8(
 
     Returns:
         ``(q, s)``: the FP8 output ``[B, S, D]`` and its float32 token scales ``[B * S, 1]``.
-
-    Raises:
-        ValueError: If a tensor is not on CUDA.
     """
-    _check(z, shift, scale)
     return _adaln_fp8(z.contiguous(), shift.contiguous(), scale.contiguous(), eps)
 
 
@@ -275,9 +269,5 @@ def rowquant(x: torch.Tensor, gelu: bool = False) -> tuple[torch.Tensor, torch.T
     Returns:
         ``(q, s)``: the FP8 tokens ``[B, S, K]`` and their float32 scales ``[B * S, 1]``.
         See ``fp8_linear``.
-
-    Raises:
-        ValueError: If ``x`` is not on CUDA.
     """
-    _check(x)
     return _rowquant(x.contiguous(), gelu)

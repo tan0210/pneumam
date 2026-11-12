@@ -2,7 +2,7 @@ import torch
 import triton
 from triton import language as tl
 
-from .common import _check, tuned_rows
+from .common import tuned_rows
 
 _CONFIGS = [
     triton.Config({"R": r}, num_warps=nw)
@@ -157,7 +157,6 @@ def _launch_fwd(x, r, g, shuf):
 
 @torch.library.custom_op("pneumam::rms_silu", mutates_args=())
 def _rms_silu(x: torch.Tensor, gamma: torch.Tensor) -> torch.Tensor:
-    _check(x)
     return _launch_fwd(x.contiguous(), None, gamma, False)[1]
 
 
@@ -170,7 +169,6 @@ def _(x, gamma):
 def _add_rms_silu(
     x: torch.Tensor, residual: torch.Tensor, gamma: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    _check(x)
     return _launch_fwd(x.contiguous(), residual.contiguous(), gamma, False)
 
 
@@ -183,7 +181,6 @@ def _(x, residual, gamma):
 def _shuffle_rms_silu(
     u: torch.Tensor, gamma: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    _check(u)
     return _launch_fwd(u.contiguous(), None, gamma, True)
 
 
@@ -294,7 +291,7 @@ def rms_silu(x: torch.Tensor, gamma: torch.Tensor) -> torch.Tensor:
     Computes ``silu(normalize(x, dim=-1) * sqrt(C) * gamma)``.
 
     Args:
-        x: Activations with channels last, shape ``[..., C]``, CUDA.
+        x: Activations with channels last, shape ``[..., C]``.
         gamma: Per-channel scale, shape ``[C]``.
 
     Returns:
@@ -309,7 +306,7 @@ def add_rms_silu(
     """Residual add followed by ``rms_silu`` of the sum.
 
     Args:
-        x: Branch output with channels last, shape ``[..., C]``, CUDA.
+        x: Branch output with channels last, shape ``[..., C]``.
         residual: Skip connection, same shape as ``x``.
         gamma: Per-channel scale of the following norm, shape ``[C]``.
 
@@ -325,7 +322,7 @@ def shuffle_rms_silu(
     """Depth-to-space by 2 followed by ``rms_silu``.
 
     Args:
-        u: Sub-pixel activations, shape ``[B, H, W, 4 * C]``, CUDA. Channel ``(2 * a + b) * C + c``
+        u: Sub-pixel activations, shape ``[B, H, W, 4 * C]``. Channel ``(2 * a + b) * C + c``
             is the value of channel ``c`` at output row ``2 * i + a``, column ``2 * j + b``.
         gamma: Per-channel scale, shape ``[C]``.
 

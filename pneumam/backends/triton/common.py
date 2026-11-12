@@ -2,13 +2,6 @@ from collections.abc import Callable, Hashable
 
 from triton.testing import do_bench
 
-
-def _check(*ts):
-    for t in ts:
-        if not t.is_cuda:
-            raise ValueError("CUDA tensors required")
-
-
 _ROWS: dict[Hashable, int] = {}
 
 

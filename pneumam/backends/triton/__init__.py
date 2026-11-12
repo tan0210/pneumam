@@ -17,7 +17,7 @@ if available:
         rowquant,
     )
     from .rms import add_rms_silu, rms_silu, shuffle_rms_silu
-    from .rope import head_norm, qkv_norm_rope
+    from .rope import head_norm, head_norm_fp8, qkv_norm_rope, qkv_norm_rope_fp8
 
     __all__ = [
         "FP8Weight",
@@ -28,7 +28,9 @@ if available:
         "ctx_scale",
         "fp8_linear",
         "head_norm",
+        "head_norm_fp8",
         "qkv_norm_rope",
+        "qkv_norm_rope_fp8",
         "quantize_weight",
         "residual_adaln",
         "residual_adaln_fp8",

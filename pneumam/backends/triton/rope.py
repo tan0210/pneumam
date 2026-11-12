@@ -2,7 +2,8 @@ import torch
 import triton
 from triton import language as tl
 
-from .common import _check, tuned_rows
+from .._fp8 import FP8
+from .common import tuned_rows
 
 _HEAD_CONFIGS = [
     triton.Config({"HPP": hpp}, num_warps=nw) for hpp in (2, 4, 8, 16) for nw in (4, 8)
@@ -20,6 +21,7 @@ def _section(
     position,
     group,
     eps,
+    scale,
     SRC_ROW: tl.constexpr,
     SRC_COL: tl.constexpr,
     DST_ROW: tl.constexpr,
@@ -28,6 +30,7 @@ def _section(
     HALF: tl.constexpr,
     NORM: tl.constexpr,
     ROTATE: tl.constexpr,
+    FP8: tl.constexpr,
 ):
     head = group * HPP + tl.arange(0, HPP)[:, None]
     dim = tl.arange(0, HALF)[None, :]
@@ -44,8 +47,8 @@ def _section(
         )[:, None]
         wa = tl.load(w_ptr + dim).to(tl.float32)
         wb = tl.load(w_ptr + HALF + dim).to(tl.float32)
-        a = (a * rstd * wa).to(dst_ptr.dtype.element_ty).to(tl.float32)
-        b = (b * rstd * wb).to(dst_ptr.dtype.element_ty).to(tl.float32)
+        a = (a * rstd * wa).to(src_ptr.dtype.element_ty).to(tl.float32)
+        b = (b * rstd * wb).to(src_ptr.dtype.element_ty).to(tl.float32)
     if ROTATE:
         cos = tl.load(cos_ptr + position * HALF + dim).to(tl.float32)
         sin = tl.load(sin_ptr + position * HALF + dim).to(tl.float32)
@@ -54,11 +57,14 @@ def _section(
     else:
         out_a = a
         out_b = b
+    if FP8:
+        out_a = tl.minimum(tl.maximum(out_a * scale, -448.0), 448.0)
+        out_b = tl.minimum(tl.maximum(out_b * scale, -448.0), 448.0)
     tl.store(dst, out_a.to(dst_ptr.dtype.element_ty), mask=mask)
     tl.store(dst + HALF, out_b.to(dst_ptr.dtype.element_ty), mask=mask)
 
 
-@triton.autotune(configs=_HEAD_CONFIGS, key=["HEADS", "HALF"])
+@triton.autotune(configs=_HEAD_CONFIGS, key=["HEADS", "HALF", "FP8"])
 @triton.jit
 def _qkv_norm_rope_kernel(
     qkv_ptr,
@@ -71,9 +77,13 @@ def _qkv_norm_rope_kernel(
     sin_ptr,
     S,
     eps,
+    q_scale,
+    k_scale,
+    v_scale,
     HEADS: tl.constexpr,
     HALF: tl.constexpr,
     HPP: tl.constexpr,
+    FP8: tl.constexpr,
 ):
     token = tl.program_id(0).to(tl.int64)
     group = tl.program_id(1)
@@ -92,6 +102,7 @@ def _qkv_norm_rope_kernel(
             position,
             group,
             eps,
+            q_scale,
             row,
             tl.constexpr(0),
             width,
@@ -100,6 +111,7 @@ def _qkv_norm_rope_kernel(
             HALF,
             tl.constexpr(True),
             tl.constexpr(True),
+            FP8,
         )
     elif group < 2 * gq:
         _section(
@@ -112,6 +124,7 @@ def _qkv_norm_rope_kernel(
             position,
             group - gq,
             eps,
+            k_scale,
             row,
             width,
             width,
@@ -120,6 +133,7 @@ def _qkv_norm_rope_kernel(
             HALF,
             tl.constexpr(True),
             tl.constexpr(True),
+            FP8,
         )
     else:
         _section(
@@ -132,6 +146,7 @@ def _qkv_norm_rope_kernel(
             position,
             group - 2 * gq,
             eps,
+            v_scale,
             row,
             2 * width,
             width,
@@ -140,13 +155,22 @@ def _qkv_norm_rope_kernel(
             HALF,
             tl.constexpr(False),
             tl.constexpr(False),
+            FP8,
         )
 
 
-@triton.autotune(configs=_HEAD_CONFIGS, key=["HEADS", "HALF"])
+@triton.autotune(configs=_HEAD_CONFIGS, key=["HEADS", "HALF", "FP8"])
 @triton.jit
 def _head_norm_kernel(
-    x_ptr, y_ptr, w_ptr, eps, HEADS: tl.constexpr, HALF: tl.constexpr, HPP: tl.constexpr
+    x_ptr,
+    y_ptr,
+    w_ptr,
+    eps,
+    scale,
+    HEADS: tl.constexpr,
+    HALF: tl.constexpr,
+    HPP: tl.constexpr,
+    FP8: tl.constexpr,
 ):
     token = tl.program_id(0).to(tl.int64)
     group = tl.program_id(1)
@@ -161,6 +185,7 @@ def _head_norm_kernel(
         token,
         group,
         eps,
+        scale,
         width,
         tl.constexpr(0),
         width,
@@ -169,6 +194,7 @@ def _head_norm_kernel(
         HALF,
         tl.constexpr(True),
         tl.constexpr(False),
+        FP8,
     )
 
 
@@ -188,7 +214,22 @@ def _qkv_norm_rope(
     k = torch.empty_like(q)
     grid = lambda meta: (B * S, 2 * triton.cdiv(heads, meta["HPP"]))
     _qkv_norm_rope_kernel[grid](
-        qkv, q, k, q, q_weight, k_weight, cos, sin, S, eps, HEADS=heads, HALF=half
+        qkv,
+        q,
+        k,
+        q,
+        q_weight,
+        k_weight,
+        cos,
+        sin,
+        S,
+        eps,
+        1.0,
+        1.0,
+        1.0,
+        HEADS=heads,
+        HALF=half,
+        FP8=False,
     )
     return q, k
 
@@ -200,6 +241,53 @@ def _(qkv, q_weight, k_weight, cos, sin, heads, eps):
     return q, torch.empty_like(q)
 
 
+@torch.library.custom_op("pneumam::qkv_norm_rope_fp8", mutates_args=())
+def _qkv_norm_rope_fp8(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    heads: int,
+    q_scale: float,
+    k_scale: float,
+    v_scale: float,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    B, S, _ = qkv.shape
+    half = cos.shape[1]
+    q = torch.empty((B, S, heads, 2 * half), dtype=FP8, device=qkv.device)
+    k = torch.empty_like(q)
+    v = torch.empty_like(q)
+    grid = lambda meta: (B * S, 3 * triton.cdiv(heads, meta["HPP"]))
+    _qkv_norm_rope_kernel[grid](
+        qkv,
+        q,
+        k,
+        v,
+        q_weight,
+        k_weight,
+        cos,
+        sin,
+        S,
+        eps,
+        q_scale,
+        k_scale,
+        v_scale,
+        HEADS=heads,
+        HALF=half,
+        FP8=True,
+    )
+    return q, k, v
+
+
+@_qkv_norm_rope_fp8.register_fake
+def _(qkv, q_weight, k_weight, cos, sin, heads, q_scale, k_scale, v_scale, eps):
+    B, S, _ = qkv.shape
+    q = torch.empty((B, S, heads, 2 * cos.shape[1]), dtype=FP8, device=qkv.device)
+    return q, torch.empty_like(q), torch.empty_like(q)
+
+
 @torch.library.custom_op("pneumam::head_norm", mutates_args=())
 def _head_norm(
     x: torch.Tensor, weight: torch.Tensor, heads: int, eps: float
@@ -208,13 +296,35 @@ def _head_norm(
     hd = weight.numel()
     y = x.new_empty((B, S, heads, hd))
     grid = lambda meta: (B * S, triton.cdiv(heads, meta["HPP"]))
-    _head_norm_kernel[grid](x, y, weight, eps, HEADS=heads, HALF=hd // 2)
+    _head_norm_kernel[grid](
+        x, y, weight, eps, 1.0, HEADS=heads, HALF=hd // 2, FP8=False
+    )
     return y
 
 
 @_head_norm.register_fake
 def _(x, weight, heads, eps):
     return x.new_empty((x.shape[0], x.shape[1], heads, weight.numel()))
+
+
+@torch.library.custom_op("pneumam::head_norm_fp8", mutates_args=())
+def _head_norm_fp8(
+    x: torch.Tensor, weight: torch.Tensor, heads: int, scale: float, eps: float
+) -> torch.Tensor:
+    B, S, _ = x.shape
+    hd = weight.numel()
+    y = torch.empty((B, S, heads, hd), dtype=FP8, device=x.device)
+    grid = lambda meta: (B * S, triton.cdiv(heads, meta["HPP"]))
+    _head_norm_kernel[grid](
+        x, y, weight, eps, scale, HEADS=heads, HALF=hd // 2, FP8=True
+    )
+    return y
+
+
+@_head_norm_fp8.register_fake
+def _(x, weight, heads, scale, eps):
+    shape = (x.shape[0], x.shape[1], heads, weight.numel())
+    return torch.empty(shape, dtype=FP8, device=x.device)
 
 
 _BWD_CONFIGS = [triton.Config({}, num_warps=nw) for nw in (4, 8)]
@@ -316,12 +426,14 @@ def _qkv_norm_rope_bwd_kernel(
                     s,
                     group - 2 * gq,
                     eps,
+                    1.0,
                     width,
                     tl.constexpr(0),
                     row,
                     HEADS,
                     HPP,
                     HALF,
+                    tl.constexpr(False),
                     tl.constexpr(False),
                     tl.constexpr(False),
                 )
@@ -537,7 +649,22 @@ def _qkv_norm_rope_v(
     v = torch.empty_like(q)
     grid = lambda meta: (B * S, 3 * triton.cdiv(heads, meta["HPP"]))
     _qkv_norm_rope_kernel[grid](
-        qkv, q, k, v, q_weight, k_weight, cos, sin, S, eps, HEADS=heads, HALF=half
+        qkv,
+        q,
+        k,
+        v,
+        q_weight,
+        k_weight,
+        cos,
+        sin,
+        S,
+        eps,
+        1.0,
+        1.0,
+        1.0,
+        HEADS=heads,
+        HALF=half,
+        FP8=False,
     )
     return q, k, v
 
@@ -650,6 +777,21 @@ torch.library.register_autograd(
 )
 
 
+def _check_qkv(qkv, cos, sin, heads):
+    if (
+        not qkv.is_contiguous()
+        or qkv.ndim != 3
+        or qkv.shape[-1] != 3 * heads * 2 * cos.shape[1]
+    ):
+        raise ValueError("qkv must be contiguous [B, S, 3 * heads * head_dim]")
+    if (
+        cos.shape != sin.shape
+        or cos.shape[0] != qkv.shape[1]
+        or (cos.shape[1] & (cos.shape[1] - 1))
+    ):
+        raise ValueError("cos/sin must be [S, head_dim // 2] with a power-of-two width")
+
+
 def qkv_norm_rope(
     qkv: torch.Tensor,
     q_weight: torch.Tensor,
@@ -677,21 +819,9 @@ def qkv_norm_rope(
         ``v`` is a strided view of ``qkv``.
 
     Raises:
-        ValueError: If a tensor is not on CUDA or a shape requirement above is not met.
+        ValueError: If a shape requirement above is not met.
     """
-    _check(qkv, q_weight, k_weight, cos, sin)
-    if (
-        not qkv.is_contiguous()
-        or qkv.ndim != 3
-        or qkv.shape[-1] != 3 * heads * 2 * cos.shape[1]
-    ):
-        raise ValueError("qkv must be contiguous [B, S, 3 * heads * head_dim]")
-    if (
-        cos.shape != sin.shape
-        or cos.shape[0] != qkv.shape[1]
-        or (cos.shape[1] & (cos.shape[1] - 1))
-    ):
-        raise ValueError("cos/sin must be [S, head_dim // 2] with a power-of-two width")
+    _check_qkv(qkv, cos, sin, heads)
     args = (
         qkv,
         q_weight.contiguous(),
@@ -710,6 +840,57 @@ def qkv_norm_rope(
     return q, k, v
 
 
+def qkv_norm_rope_fp8(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    heads: int,
+    q_scale: float,
+    k_scale: float,
+    v_scale: float = 1.0,
+    eps: float = 1e-5,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``qkv_norm_rope`` whose outputs are FP8, each multiplied by a fixed scale. Forward only.
+
+    Values beyond 448 in magnitude after scaling are clipped. See ``norm_scale`` for a scale
+    that never clips Q or K.
+
+    Args:
+        qkv: Fused projection, contiguous, shape ``[B, S, 3 * heads * hd]``.
+        q_weight: Q norm scale, shape ``[hd]``.
+        k_weight: K norm scale, shape ``[hd]``.
+        cos: Rotary cosines, shape ``[S, hd // 2]`` with ``hd // 2`` a power of two.
+        sin: Rotary sines, shape ``[S, hd // 2]``.
+        heads: Number of heads.
+        q_scale: Factor applied to Q before quantizing.
+        k_scale: Factor applied to K before quantizing.
+        v_scale: Factor applied to V before quantizing.
+        eps: Epsilon added to the mean square.
+
+    Returns:
+        ``(q, k, v)``, each FP8 of shape ``[B, S, heads, hd]``. Divide by the scales to recover
+        the values.
+
+    Raises:
+        ValueError: If a shape requirement above is not met.
+    """
+    _check_qkv(qkv, cos, sin, heads)
+    return _qkv_norm_rope_fp8(
+        qkv,
+        q_weight.contiguous(),
+        k_weight.contiguous(),
+        cos.contiguous(),
+        sin.contiguous(),
+        heads,
+        q_scale,
+        k_scale,
+        v_scale,
+        eps,
+    )
+
+
 def head_norm(
     x: torch.Tensor, weight: torch.Tensor, heads: int, eps: float = 1e-5
 ) -> torch.Tensor:
@@ -725,9 +906,37 @@ def head_norm(
         Tensor of shape ``[B, S, heads, hd]`` with the dtype of ``x``.
 
     Raises:
-        ValueError: If a tensor is not on CUDA or ``x`` is not contiguous ``[B, S, heads * hd]``.
+        ValueError: If ``x`` is not contiguous ``[B, S, heads * hd]``.
     """
-    _check(x, weight)
     if not x.is_contiguous() or x.shape[-1] != heads * weight.numel():
         raise ValueError("x must be contiguous [B, S, heads * head_dim]")
     return _head_norm(x, weight.contiguous(), heads, eps)
+
+
+def head_norm_fp8(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    heads: int,
+    scale: float,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    """``head_norm`` whose output is FP8, multiplied by a fixed scale. Forward only.
+
+    Values beyond 448 in magnitude after scaling are clipped. See ``norm_scale``.
+
+    Args:
+        x: Tokens, contiguous, shape ``[B, S, heads * hd]``.
+        weight: Per-dimension scale, shape ``[hd]``.
+        heads: Number of heads.
+        scale: Factor applied before quantizing.
+        eps: Epsilon added to the mean square.
+
+    Returns:
+        FP8 tensor of shape ``[B, S, heads, hd]``.
+
+    Raises:
+        ValueError: If ``x`` is not contiguous ``[B, S, heads * hd]``.
+    """
+    if not x.is_contiguous() or x.shape[-1] != heads * weight.numel():
+        raise ValueError("x must be contiguous [B, S, heads * head_dim]")
+    return _head_norm_fp8(x, weight.contiguous(), heads, scale, eps)

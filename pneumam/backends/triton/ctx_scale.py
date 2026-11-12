@@ -2,8 +2,6 @@ import torch
 import triton
 from triton import language as tl
 
-from .common import _check
-
 
 @triton.jit
 def _ctx_scale_kernel(
@@ -155,9 +153,8 @@ def ctx_scale(
         Tensor with the shape and dtype of ``out``.
 
     Raises:
-        ValueError: If a tensor is not on CUDA or the shapes do not match.
+        ValueError: If the shapes do not match.
     """
-    _check(out, lse, ln_pad)
     if out.ndim != 4 or lse.shape != (out.shape[0], out.shape[2], out.shape[1]):
         raise ValueError("out must be [B, S, H, hd] and lse [B, H, S]")
     return _ctx_scale(
