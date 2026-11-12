@@ -20,15 +20,15 @@ triton = [
 ]
 sm90 = [
     "pneumam[triton]",
-    "quack-kernels[cu13]; sys_platform == 'linux'",
+    "quack-kernels[cu13]",
     "flash-attn-4>=4.0.0b38; sys_platform == 'linux'",
 ]
 sm120 = [
     "pneumam[triton]",
-    "warpy-kernels; sys_platform == 'linux'",
+    "warpy-kernels",
 ]
 vae = [
-    "ffpa-attn>=0.2.1; sys_platform == 'linux'",
+    "ffpa-attn>=0.2.1",
 ]
 text = [
     "transformers>=5.22.1",
@@ -56,6 +56,11 @@ module-root = ""
 
 [tool.uv]
 environments = ["sys_platform == 'linux'", "sys_platform == 'win32'"]
+
+[tool.basedpyright]
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "standard"
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
