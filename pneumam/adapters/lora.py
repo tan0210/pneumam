@@ -57,9 +57,6 @@ class LoRALinear(nn.Module):
         self.lora_A = nn.Parameter(torch.empty(parts * rank, base.in_features, **kw))
         self.lora_B = nn.Parameter(torch.zeros(parts, out, rank, **kw))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-        self.cache_casts = True
-        self._key = None
-        self._cast: tuple[torch.Tensor, torch.Tensor] | None = None
 
     @property
     def weight(self) -> torch.Tensor:
@@ -81,22 +78,14 @@ class LoRALinear(nn.Module):
         """
         lead = x.shape[:-1]
         flat = x.reshape(-1, x.shape[-1])
-        a, bs = self._cached(flat.dtype)
+        with torch.no_grad():
+            a = self.lora_A.to(
+                flat.dtype
+            )  # cast every call: optimizers may update in place
+            bs = (self.lora_B * self.scale).to(flat.dtype)
         base, low = self.base(flat), self.drop(flat)
         out = lora_add(base, low, self.lora_A, self.lora_B, a, bs, self.scale)
         return out.view(*lead, out.shape[-1])
-
-    def _cached(self, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
-        A, B = self.lora_A, self.lora_B
-        if not self.cache_casts or torch.compiler.is_compiling():
-            with torch.no_grad():
-                return A.to(dtype), (B * self.scale).to(dtype)
-        key = (A._version, B._version, A.data_ptr(), B.data_ptr(), dtype)
-        if self._key != key or self._cast is None:
-            with torch.no_grad():
-                self._cast = (A.to(dtype), (B * self.scale).to(dtype))
-            self._key = key
-        return self._cast
 
     def delta_weight(self) -> torch.Tensor:
         """Weight update this adapter adds to the base weight.

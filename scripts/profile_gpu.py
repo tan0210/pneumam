@@ -11,8 +11,9 @@ from typing import Any, cast
 import torch
 
 from pneumam import models
+from pneumam.adapters import lora as L
 from pneumam.backends import ffpa, flash_attn, quack, triton, warpy
-from pneumam.graphs import Graphed
+from pneumam.graphs import Graphed, GraphedStep
 from pneumam.models.anima import fused
 from pneumam.models.anima.config import AnimaConfig
 from pneumam.models.anima.dit import AnimaDiT
@@ -527,6 +528,142 @@ def ops(
     return rows
 
 
+def train(
+    args: argparse.Namespace, model: AnimaDiT, width: int, height: int, batch: int
+) -> dict[str, Any]:
+    """Time a LoRA training step: forward, backward and optimizer, eager and as a CUDA graph.
+
+    Args:
+        args: Parsed options with ``lora_rank``.
+        model: The model, without adapters.
+        width: Image width in pixels.
+        height: Image height in pixels.
+        batch: Samples per step.
+
+    Returns:
+        The timing rows and one profiler table per checkpointing setting.
+    """
+    from torch.profiler import ProfilerActivity, profile
+
+    device, dt = model.patch.weight.device, model.compute_dtype
+    size = f"{width}x{height} b{batch}"
+    x0 = noise(batch, height // 8, width // 8, model.cfg.in_ch, 0, device)
+    eps = noise(batch, height // 8, width // 8, model.cfg.in_ch, 1, device)
+    sigma = torch.linspace(0.2, 0.9, batch, device=device)
+    s = sigma.view(batch, 1, 1, 1)
+    xt, target = ((1 - s) * x0 + s * eps).to(dt), eps - x0
+    text = make_text(args, model, batch)
+    rows: list[dict[str, Any]] = []
+    tables: dict[str, str] = {}
+
+    def add(
+        label: str, fn: Callable[[], Any], base: float | None = None
+    ) -> float | None:
+        def run():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(device)
+            r = bench(fn, args.warmup, args.iters)
+            r["peak_gb"] = torch.cuda.max_memory_allocated(device) / 2**30
+            return r
+
+        r = attempt(f"train {size} {label}", run)
+        if r is None:
+            return None
+        ratio = f"{r['ms'] / base:5.2f}x inference" if base else ""
+        rows.append({"size": size, "what": label, **r})
+        print(f"  {label:44s} {r['ms']:8.2f} ms  peak {r['peak_gb']:5.1f} GB  {ratio}")
+        return r["ms"]
+
+    def infer():
+        with torch.no_grad():
+            rt = Runtime()
+            return fused.forward(model, rt, xt, sigma, model.encode_context(rt, text))
+
+    base = add("inference forward, no adapter", infer)
+    params = L.add_lora(model, rank=args.lora_rank)
+    try:
+        with torch.no_grad():
+            for p in params[1::2]:
+                p.normal_(std=0.02)  # a zero B would hide the adapter's gradient path
+        add("inference forward, adapter attached", infer, base)
+        inputs = (xt, sigma, text, target)
+        for ckpt in (False, True):
+            rt = Runtime(checkpointing=ckpt)
+            tag = f"checkpointing {'on' if ckpt else 'off'}"
+
+            def loss_fn(xt, sigma, text, target, rt=rt):
+                return torch.nn.functional.mse_loss(
+                    model.velocity(rt, xt, sigma, text).float(), target
+                )
+
+            def forward_only(loss_fn=loss_fn):
+                return loss_fn(*inputs)
+
+            def forward_backward(loss_fn=loss_fn):
+                loss_fn(*inputs).backward()
+                grads = [p.grad for p in params]
+                for p in params:
+                    p.grad = None
+                return grads
+
+            add(f"{tag}: forward with autograd", forward_only, base)
+            add(f"{tag}: forward + backward", forward_backward, base)
+            opt = torch.optim.AdamW(params, lr=0.0, weight_decay=0.0, fused=True)
+
+            def full_step(loss_fn=loss_fn, opt=opt):
+                loss_fn(*inputs).backward()
+                torch.nn.utils.clip_grad_norm_(params, 1.0)
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+
+            add(f"{tag}: full step with AdamW", full_step, base)
+
+            def graphed(loss_fn=loss_fn, tag=tag):
+                grads = [g for g in forward_backward() if g is not None]
+                want = torch.cat([g.flatten().float() for g in grads])
+                runner = GraphedStep(loss_fn, params)
+                runner(*inputs)
+                got = torch.cat([p.grad.flatten().float() for p in params])  # type: ignore
+                print(f"  {tag}: graph vs eager gradient rel err {rel(got, want):.2e}")
+                add(
+                    f"{tag}: forward + backward, CUDA graph",
+                    lambda: runner(*inputs),
+                    base,
+                )
+                opt = torch.optim.AdamW(
+                    params, lr=0.0, weight_decay=0.0, fused=True, capturable=True
+                )
+                stepper = GraphedStep(loss_fn, params, opt, 1.0)
+                add(f"{tag}: full step, CUDA graph", lambda: stepper(*inputs), base)
+
+            attempt(f"train {size} {tag} graph", graphed)
+
+            def traced(forward_backward=forward_backward):
+                for _ in range(2):
+                    forward_backward()
+                kinds = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+                with profile(activities=kinds) as prof:
+                    for _ in range(3):
+                        forward_backward()
+                    torch.cuda.synchronize()
+                return prof.key_averages().table(
+                    sort_by="self_cuda_time_total", row_limit=args.top
+                )
+
+            if "trace" not in args.skip:
+                table = attempt(f"train {size} {tag} trace", traced)
+                if table is not None:
+                    tables[tag] = table
+                    heading(f"{size}, {tag}, three forward + backward passes")
+                    print(table)
+    finally:
+        L.remove_lora(model, merge=False)
+        for p in model.parameters():
+            p.grad = None
+        torch.cuda.empty_cache()
+    return {"rows": rows, "tables": tables}
+
+
 @torch.no_grad()
 def trace(
     args: argparse.Namespace, model: AnimaDiT, width: int, height: int
@@ -653,8 +790,10 @@ def main(argv: list[str] | None = None) -> int:
         "--skip",
         nargs="*",
         default=[],
-        choices=["check", "graph", "steps", "ops", "trace", "decode"],
+        choices=["check", "graph", "steps", "ops", "trace", "decode", "train"],
     )
+    ap.add_argument("--lora-rank", type=int, default=16)
+    ap.add_argument("--train-batches", type=int, nargs="+", default=[1, 4])
     ap.add_argument("--out", default="profile_out")
     args = ap.parse_args(argv)
 
@@ -676,6 +815,14 @@ def main(argv: list[str] | None = None) -> int:
             ],
         ),
         ("trace", lambda: trace(args, model, *sizes[0])),
+        (
+            "train",
+            lambda: [
+                train(args, model, w, h, b)
+                for w, h in sizes
+                for b in args.train_batches
+            ],
+        ),
     ]
     if args.vae:
         sections.append(

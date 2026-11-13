@@ -266,6 +266,25 @@ class AnimaDiT(nn.Module):
 
         return prepare(self, rt, sigmas, cond)
 
+    def velocity(
+        self, rt: Runtime, x: torch.Tensor, t: torch.Tensor, cond: torch.Tensor
+    ) -> torch.Tensor:
+        """Predict the velocity for noisy latents, each at its own noise level. Differentiable.
+
+        Args:
+            rt: The model's runtime.
+            x: Noisy latents in the compute dtype, shape ``[B, H, W, C]``.
+            t: Noise level of each latent, shape ``[B]``.
+            cond: Text embeddings in the compute dtype, shape ``[B, S, text_dim]``, zero-padded
+                along ``S``.
+
+        Returns:
+            Predicted velocity, shape ``[B, H, W, C]``.
+        """
+        from .fused import forward
+
+        return forward(self, rt, x, t, self.encode_context(rt, cond))
+
     def tables(
         self, rt: Runtime, h: int, w: int, device: str | torch.device
     ) -> tuple[torch.Tensor, torch.Tensor]:
