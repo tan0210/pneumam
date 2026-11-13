@@ -528,10 +528,48 @@ def ops(
     return rows
 
 
+def tune(
+    args: argparse.Namespace, model: AnimaDiT, sizes: list[tuple[int, ...]]
+) -> list[dict[str, Any]]:
+    """Tune the GPU kernels for every shape the other sections measure.
+
+    Args:
+        args: Parsed options.
+        model: The model.
+        sizes: Image sizes as ``(width, height)``.
+
+    Returns:
+        One row per size and batch with the time tuning took.
+    """
+    heading("tune")
+    rows = []
+    batches = sorted({2 * args.batch, 1, *args.train_batches})
+    for width, height in sizes:
+        for batch in batches:
+            for mode in ("bf16", "fp8"):
+                rt = runtime(model, mode)
+                t0 = time.perf_counter()
+                n = fused.warmup(
+                    model, rt, height // 8, width // 8, batch, args.ctx_len
+                )
+                seconds = time.perf_counter() - t0
+                rows.append(
+                    {
+                        "size": f"{width}x{height}",
+                        "batch": batch,
+                        "mode": mode,
+                        "s": seconds,
+                    }
+                )
+                print(
+                    f"  {width}x{height} batch {batch} {mode}: {n} kernels in {seconds:.1f} s"
+                )
+    return rows
+
+
 TRAIN_VARIANTS = (
     ("bf16", False, False, False),
     ("fp8 attention", False, False, True),
-    ("fp8 attention + fp8 base", True, True, True),
 )
 
 
@@ -801,6 +839,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--lora-rank", type=int, default=16)
     ap.add_argument("--train-batches", type=int, nargs="+", default=[1, 4])
+    ap.add_argument(
+        "--tune",
+        action="store_true",
+        help="Tune the GPU kernels for every measured shape first. Slow the first time.",
+    )
     ap.add_argument("--out", default="profile_out")
     args = ap.parse_args(argv)
 
@@ -809,6 +852,8 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps(report["environment"], indent=1))
     model = build_model(args, device)
     sizes = [tuple(int(v) for v in s.lower().split("x")) for s in args.sizes]
+    if args.tune:
+        report["tune"] = attempt("tune", lambda: tune(args, model, sizes))
     sections: list[tuple[str, Callable[[], Any]]] = [
         ("check", lambda: check(args, model)),
         ("graph", lambda: graph_check(args, model)),

@@ -228,3 +228,126 @@ def test_lora_linear_matches_the_dense_formula_and_its_gradients(parts, fp8):
     assert rel(got[0], want[0]) < (1e-4 if fp8 != "both" else 0.05)
     assert rel(got[1], want[1]) < 1e-4 and rel(got[2], want[2]) < 1e-4
     assert w.grad is None
+
+
+def test_warpy_mlp_gradients_with_a_stand_in_kernel(monkeypatch):
+    gelu = torch.nn.functional.gelu
+
+    def fake_gemm(
+        a, b, out=None, act="", store_pre=False, pre=None, b_trans=False, **config
+    ):
+        assert a.is_contiguous() and not a.requires_grad and not b.requires_grad
+        prod = a.float() @ (b.float() if b_trans else b.float().T)
+        if act == "gelu":
+            return gelu(prod).to(a.dtype), (prod.to(a.dtype) if store_pre else None)
+        if act == "dgelu":
+            h = pre.float()
+            density = torch.exp(-0.5 * h * h) / (2 * torch.pi) ** 0.5
+            slope = 0.5 * (1 + torch.erf(h / 2**0.5)) + h * density
+            prod = prod * slope
+        if out is not None:
+            out.copy_(prod)
+            return out
+        return prod.to(a.dtype)
+
+    monkeypatch.setattr(warpy, "_wk", type("W", (), {"gemm": staticmethod(fake_gemm)}))
+    monkeypatch.setattr(warpy, "_key", lambda a, w, act: "k")
+    monkeypatch.setattr(warpy, "available", True)
+    monkeypatch.setattr(gemm._dispatch, "arch", lambda device: "sm120")
+    x = torch.randn(2, 64, 64, requires_grad=True)
+    w1 = torch.randn(128, 64, requires_grad=True)
+    w2 = torch.randn(128, 128, requires_grad=True)
+    cast = lambda t: t.to(torch.bfloat16)
+    assert warpy.fits_mlp_grad(cast(x), cast(w1), cast(w2))
+    assert not warpy.fits_mlp_grad(cast(x)[:, :50], cast(w1), cast(w2))
+    out = gemm.mlp(cast(x), cast(w1), cast(w2))
+    dense = gelu(x @ w1.T) @ w2.T
+    assert out.dtype == torch.bfloat16 and rel(out, dense) < 0.02
+    cot = torch.randn_like(dense)
+    got = torch.autograd.grad((out.float() * cot).sum(), (x, w1, w2))
+    want = torch.autograd.grad((dense * cot).sum(), (x, w1, w2))
+    assert all(rel(a, b) < 0.03 for a, b in zip(got, want, strict=True))
+    frozen = gemm.mlp(cast(x), cast(w1).detach(), cast(w2).detach())
+    (dx,) = torch.autograd.grad((frozen.float() * cot).sum(), x)
+    assert rel(dx, want[0]) < 0.03
+
+
+def lora_mlp_case():
+    n, i, h, o, r = 128, 128, 256, 128, 4
+    x = torch.randn(n, i, requires_grad=True)
+    w1, w2 = torch.randn(h, i) * 0.2, torch.randn(o, h) * 0.2
+    leaves = [
+        torch.randn(s, requires_grad=True)
+        for s in ((r, i), (1, h, r), (r, h), (1, o, r))
+    ]
+    A1, B1, A2, B2 = leaves
+    s1, s2 = 0.5, 2.0
+    up = (w1, A1, B1, A1.detach(), (B1 * s1).detach(), s1)
+    down = (w2, A2, B2, A2.detach(), (B2 * s2).detach(), s2)
+    pre = x @ w1.T + s1 * x @ (B1[0] @ A1).T
+    post = torch.nn.functional.gelu(pre)
+    dense = post @ w2.T + s2 * post @ (B2[0] @ A2).T
+    return x, up, down, dense, (x, *leaves)
+
+
+def test_lora_mlp_matches_the_dense_formula_and_its_gradients():
+    x, up, down, dense, leaves = lora_mlp_case()
+    out = lora.lora_mlp(x, up, down)
+    assert rel(out, dense) < 1e-5
+    cot = torch.randn_like(dense)
+    got = torch.autograd.grad((out * cot).sum(), leaves)
+    want = torch.autograd.grad((dense * cot).sum(), leaves)
+    assert all(rel(a, b) < 1e-4 for a, b in zip(got, want, strict=True))
+
+
+def test_accumulating_products_with_a_stand_in_kernel(monkeypatch):
+    gelu = torch.nn.functional.gelu
+    calls = []
+
+    def fake_gemm(
+        a,
+        b,
+        out=None,
+        act="",
+        store_pre=False,
+        pre=None,
+        b_trans=False,
+        accum=False,
+        **cfg,
+    ):
+        assert accum and out is not None and out.is_contiguous()
+        assert a.shape[0] % 128 == 0 and not a.requires_grad
+        calls.append((act, b_trans))
+        prod = a.float() @ (b.float() if b_trans else b.float().T) + out.float()
+        if act == "gelu":
+            out.copy_(gelu(prod))
+            return out, prod.to(a.dtype)
+        if act == "dgelu":
+            prod = prod * gemm._gelu_slope(pre)
+        out.copy_(prod)
+        return out
+
+    monkeypatch.setattr(warpy, "_wk", type("W", (), {"gemm": staticmethod(fake_gemm)}))
+    monkeypatch.setattr(warpy, "_key", lambda a, w, act: "k")
+    monkeypatch.setattr(warpy, "_ACCUM", True)
+    monkeypatch.setattr(gemm._dispatch, "arch", lambda device: "sm120")
+    x, up, down, dense, leaves = lora_mlp_case()
+    bf = lambda t: t.to(torch.bfloat16) if isinstance(t, torch.Tensor) else t
+    xb = bf(x)
+    out = lora.lora_mlp(
+        xb,
+        tuple(bf(t) for t in up[:1]) + up[1:3] + tuple(bf(t) for t in up[3:5]) + up[5:],
+        tuple(bf(t) for t in down[:1])
+        + down[1:3]
+        + tuple(bf(t) for t in down[3:5])
+        + down[5:],
+    )
+    assert rel(out, dense) < 0.03
+    cot = torch.randn_like(dense)
+    got = torch.autograd.grad((out.float() * cot).sum(), leaves)
+    want = torch.autograd.grad((dense * cot).sum(), leaves)
+    assert all(rel(a, b) < 0.05 for a, b in zip(got, want, strict=True))
+    assert calls == [("gelu", False), ("", False), ("dgelu", True), ("", True)]
+    assert not warpy.fits_accum(xb[:100], bf(up[0]))
+    monkeypatch.setattr(warpy, "_ACCUM", False)
+    assert not warpy.fits_accum(xb, bf(up[0]))

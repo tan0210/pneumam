@@ -13,6 +13,7 @@ __all__ = [
     "cross_attention_trimmed",
     "cross_attention_trimmed_quantized",
     "to_fp8",
+    "warmup",
     "wide_attention",
 ]
 
@@ -246,3 +247,40 @@ def wide_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.T
     ):
         return ffpa.attention(q.contiguous(), k.contiguous(), v.contiguous())
     return F.scaled_dot_product_attention(q, k, v)
+
+
+def warmup(
+    batch: int,
+    heads: int,
+    q_len: int,
+    k_len: int,
+    head_dim: int,
+    device: torch.device,
+    tune: bool = True,
+    verbose: bool = False,
+) -> bool:
+    """Prepare the FP8 attention kernel for one shape, tuning it if no saved result exists.
+
+    Args:
+        batch: Batch size.
+        heads: Number of heads.
+        q_len: Query sequence length.
+        k_len: Key sequence length.
+        head_dim: Head width.
+        device: CUDA device the attention will run on.
+        tune: Whether to tune the shape if no saved result exists for it.
+        verbose: Whether to print progress while tuning.
+
+    Returns:
+        True if a kernel was prepared, False if this GPU has no FP8 attention kernel.
+
+    Raises:
+        RuntimeError: If ``device`` is not a CUDA device.
+    """
+    probe = torch.empty(0, 0, heads, head_dim, device=device)
+    if not _warpy(probe):
+        return False
+    warpy.warmup_attention(
+        batch, heads, q_len, k_len, head_dim, device, False, tune, verbose
+    )
+    return True

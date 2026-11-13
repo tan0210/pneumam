@@ -1,3 +1,4 @@
+import inspect
 import json
 import math
 import os
@@ -15,6 +16,8 @@ except Exception:  # noqa: BLE001  # cutlass can fail to import in ways other th
     available = False
 
 _BM = 128
+# older releases cannot add the product to what the output buffer holds
+_ACCUM = available and "accum" in inspect.signature(_wk.gemm).parameters  # type: ignore
 _DTYPES = (torch.bfloat16, torch.float16)
 TUNE_CACHE_PATH = os.environ.get(
     "PNEUMAM_TUNE_CACHE", os.path.expanduser("~/.cache/pneumam/warpy_gemm.json")
@@ -95,7 +98,7 @@ def _launch(a, w, act, out=None) -> torch.Tensor:
 
 def _run(a: torch.Tensor, w: torch.Tensor, act: str = "") -> torch.Tensor:
     m = a.shape[0]
-    a = a.contiguous()
+    a, w = a.detach().contiguous(), w.detach()  # the kernel cannot take graph tensors
     whole = m // _BM * _BM
     if whole == m:
         return _launch(a, w, act)
@@ -177,6 +180,182 @@ def linear_gelu(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """
     y = _linear_gelu(x.reshape(-1, x.shape[-1]), weight)
     return y.view(*x.shape[:-1], weight.shape[0])
+
+
+@torch.library.custom_op("pneumam::mlp_warpy_train", mutates_args=())
+def _mlp_train(
+    x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x, w1, w2 = x.detach().contiguous(), w1.detach(), w2.detach()
+    tuned = _tuned_config(_key(x, w1, "gelu"))
+    post, pre = _wk.gemm(x, w1, act="gelu", store_pre=True, **tuned)  # type: ignore
+    return _launch(post, w2, ""), pre
+
+
+@_mlp_train.register_fake
+def _(x, w1, w2):
+    return x.new_empty(x.shape[0], w2.shape[0]), x.new_empty(x.shape[0], w1.shape[0])
+
+
+@torch.library.custom_op("pneumam::mlp_warpy_bwd", mutates_args=())
+def _mlp_bwd(
+    dout: torch.Tensor,
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    pre: torch.Tensor,
+    need_dx: bool,
+    need_dw1: bool,
+    need_dw2: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dout, x, pre = (t.detach().contiguous() for t in (dout.to(w2.dtype), x, pre))
+    w1, w2 = w1.detach(), w2.detach()
+    # one kernel multiplies by the weight and by the GELU derivative at the stored input
+    dpre = _wk.gemm(dout, w2, b_trans=True, act="dgelu", pre=pre)  # type: ignore
+    dx = _wk.gemm(dpre, w1, b_trans=True) if need_dx else x.new_empty(0)  # type: ignore
+    dw1 = dpre.T @ x if need_dw1 else w1.new_empty(0)  # type: ignore
+    dw2 = dout.T @ torch.nn.functional.gelu(pre) if need_dw2 else w2.new_empty(0)
+    return dx, dw1, dw2  # type: ignore
+
+
+@_mlp_bwd.register_fake
+def _(dout, x, w1, w2, pre, need_dx, need_dw1, need_dw2):
+    return (
+        x.new_empty(x.shape if need_dx else (0,)),
+        w1.new_empty(w1.shape if need_dw1 else (0,)),
+        w2.new_empty(w2.shape if need_dw2 else (0,)),
+    )
+
+
+def _mlp_setup(ctx, inputs, output):
+    ctx.mark_non_differentiable(output[1])
+    ctx.save_for_backward(*inputs, output[1])
+
+
+def _mlp_backward(ctx, dout, _):
+    x, w1, w2, pre = ctx.saved_tensors
+    need = ctx.needs_input_grad
+    grads = _mlp_bwd(dout, x, w1, w2, pre, *need)
+    return tuple(g if n else None for g, n in zip(grads, need, strict=True))
+
+
+_mlp_train.register_autograd(_mlp_backward, setup_context=_mlp_setup)
+
+
+def fits_mlp_grad(x: torch.Tensor, w_up: torch.Tensor, w_down: torch.Tensor) -> bool:
+    """Tell whether ``mlp_grad`` can run these operands.
+
+    Args:
+        x: Activations, shape ``[..., K]``.
+        w_up: First weight, shape ``[H, K]``.
+        w_down: Second weight, shape ``[N, H]``.
+
+    Returns:
+        True if ``fits`` accepts them in bf16 or fp16 and the activations have a multiple of
+        128 rows.
+    """
+    rows = x.numel() // x.shape[-1]
+    return x.dtype in _DTYPES and fits(x, w_up, w_down) and rows % _BM == 0
+
+
+def mlp_grad(x: torch.Tensor, w_up: torch.Tensor, w_down: torch.Tensor) -> torch.Tensor:
+    """Compute ``gelu(x @ w_up.T) @ w_down.T`` with the exact erf GELU. Differentiable.
+
+    The GELU and its derivative run inside the matrix products, in both directions.
+
+    Args:
+        x: Activations accepted by ``fits_mlp_grad``, shape ``[..., K]``.
+        w_up: Weight with the dtype of ``x``, shape ``[H, K]``.
+        w_down: Weight with the dtype of ``x``, shape ``[N, H]``.
+
+    Returns:
+        Tensor with the dtype of ``x``, shape ``[..., N]``.
+    """
+    y, _ = _mlp_train(x.reshape(-1, x.shape[-1]), w_up, w_down)
+    return y.view(*x.shape[:-1], w_down.shape[0])
+
+
+def fits_accum(x: torch.Tensor, weight: torch.Tensor, transposed: bool = False) -> bool:
+    """Tell whether the accumulating products can run these operands.
+
+    Args:
+        x: Activations, shape ``[M, K]``, or ``[M, N]`` if ``transposed``.
+        weight: Weight, shape ``[N, K]``.
+        transposed: Whether the product is ``x @ weight`` instead of ``x @ weight.T``.
+
+    Returns:
+        True if the installed library can accumulate, the operands are contiguous bf16 or fp16
+        of one dtype, ``M`` is a multiple of 128, and the product's output and inner widths are
+        multiples of 128 and 64.
+    """
+    n, k = weight.shape[::-1] if transposed else weight.shape
+    return (
+        _ACCUM
+        and x.dtype in _DTYPES
+        and weight.dtype == x.dtype
+        and weight.is_contiguous()
+        and x.shape[0] % _BM == 0
+        and n % 128 == 0
+        and k % 64 == 0
+    )
+
+
+def addmm_(
+    out: torch.Tensor, x: torch.Tensor, weight: torch.Tensor, transposed: bool = False
+) -> torch.Tensor:
+    """Add a matrix product to a buffer in place. Forward only.
+
+    Args:
+        out: Contiguous buffer with the dtype of ``x``, shape ``[M, N]``, or ``[M, K]`` if
+            ``transposed``.
+        x: Activations accepted by ``fits_accum``.
+        weight: Weight, shape ``[N, K]``.
+        transposed: Whether to add ``x @ weight`` instead of ``x @ weight.T``.
+
+    Returns:
+        ``out``.
+    """
+    x, weight = x.detach().contiguous(), weight.detach()
+    tuned = {} if transposed else _tuned_config(_key(x, weight, ""))
+    _wk.gemm(x, weight, out=out, b_trans=transposed, accum=True, **tuned)  # type: ignore
+    return out
+
+
+def gelu_addmm_(
+    out: torch.Tensor, x: torch.Tensor, weight: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute ``gelu(out + x @ weight.T)`` with the exact erf GELU. Forward only.
+
+    Args:
+        out: Contiguous buffer holding the addend, shape ``[M, N]``. It is overwritten.
+        x: Activations accepted by ``fits_accum``.
+        weight: Weight, shape ``[N, K]``.
+
+    Returns:
+        ``(post, pre)``: the result, and the sum the GELU was applied to.
+    """
+    x, weight = x.detach().contiguous(), weight.detach()
+    tuned = _tuned_config(_key(x, weight, "gelu"))
+    return _wk.gemm(x, weight, out=out, act="gelu", store_pre=True, accum=True, **tuned)  # type: ignore
+
+
+def dgelu_addmm_(
+    out: torch.Tensor, g: torch.Tensor, weight: torch.Tensor, pre: torch.Tensor
+) -> torch.Tensor:
+    """Compute ``(out + g @ weight) * gelu'(pre)`` in place. Forward only.
+
+    Args:
+        out: Contiguous buffer holding the addend, shape ``[M, K]``.
+        g: Gradient accepted by ``fits_accum`` with ``transposed``, shape ``[M, N]``.
+        weight: Weight, shape ``[N, K]``.
+        pre: Input the GELU was applied to, shape ``[M, K]``.
+
+    Returns:
+        ``out``.
+    """
+    g, weight, pre = g.detach().contiguous(), weight.detach(), pre.detach().contiguous()
+    _wk.gemm(g, weight, out=out, b_trans=True, act="dgelu", pre=pre, accum=True)  # type: ignore
+    return out
 
 
 def fp8_gemm(q: torch.Tensor, w: FP8Weight) -> torch.Tensor:

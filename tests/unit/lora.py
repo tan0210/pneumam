@@ -193,3 +193,23 @@ def test_dropout_takes_the_separate_path_and_stays_trainable():
     assert not torch.equal(dropped, kept)  # half of the adapter's input is zeroed
     dropped.square().sum().backward()
     assert all(p.grad is not None for p in params)
+
+
+def test_adapted_mlp_takes_the_fused_path_and_matches_the_separate_layers():
+    m = tiny_model()
+    params = L.add_lora(m, rank=2)
+    with torch.no_grad():
+        for p in params[1::2]:
+            p.normal_(std=0.05)
+    b = m.blocks[0]
+    x = torch.randn(3, 5, b.up.base.in_features, requires_grad=True)
+    fused_out = b.up.fused_mlp(b.down, x)
+    separate = b.down(torch.nn.functional.gelu(b.up(x)))
+    assert fused_out.shape == separate.shape and rel(fused_out, separate) < 1e-5
+    leaves = (x, b.up.lora_A, b.up.lora_B, b.down.lora_A, b.down.lora_B)
+    got = torch.autograd.grad(fused_out.square().sum(), leaves)
+    want = torch.autograd.grad(separate.square().sum(), leaves)
+    assert all(rel(a, c) < 1e-4 for a, c in zip(got, want, strict=True))
+    assert b.up.fused_mlp(torch.nn.Linear(4, 4), x) is None
+    L.enable_fp8_base(m)
+    assert b.up.fused_mlp(b.down, x) is None

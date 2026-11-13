@@ -7,15 +7,19 @@ from . import _dispatch
 
 __all__ = [
     "FP8Weight",
+    "addmm_",
+    "dgelu_addmm_",
     "fp8_linear",
     "fp8_linear_unscaled",
     "fp8_supported",
     "frozen_linear_fp8",
+    "gelu_addmm_",
     "linear",
     "linear_gelu",
     "mlp",
     "quantize_weight",
     "rowquant",
+    "warmup",
 ]
 
 _DATACENTER = ("sm90", "sm100")
@@ -80,8 +84,12 @@ def mlp(x: torch.Tensor, w_up: torch.Tensor, w_down: torch.Tensor) -> torch.Tens
     Raises:
         RuntimeError: If ``x`` is not on a CUDA device.
     """
-    if _dispatch.arch(x.device) in _DATACENTER and quack.fits(x, w_up, w_down):
+    arch = _dispatch.arch(x.device)
+    if arch in _DATACENTER and quack.fits(x, w_up, w_down):
         return quack.mlp(x, w_up, w_down)
+    grad = _needs_grad(x, w_up, w_down)
+    if arch == "sm120" and grad and warpy.fits_mlp_grad(x, w_up, w_down):
+        return warpy.mlp_grad(x, w_up, w_down)
     return linear(linear_gelu(x, w_up), w_down)
 
 
@@ -255,3 +263,111 @@ def frozen_linear_fp8(
     tq, ts = (None, None) if w8_t is None else w8_t
     y = _frozen_fp8(flat, weight, w8.q, w8.s, tq, ts)
     return y.view(*x.shape[:-1], weight.shape[0])
+
+
+def warmup(
+    rows: int,
+    weight: torch.Tensor,
+    act: str = "",
+    tune: bool = True,
+    verbose: bool = False,
+) -> bool:
+    """Prepare the kernel for one product shape, tuning it if the GPU's library supports that.
+
+    Tuning a shape for the first time on a GPU takes a while. The result is saved and reused
+    by later processes.
+
+    Args:
+        rows: Rows of the activations the weight will be multiplied by: batch times tokens.
+        weight: The ``[N, K]`` weight on its final device and in its final dtype. Pass
+            ``FP8Weight.q`` for an FP8 product.
+        act: ``"gelu"`` for ``linear_gelu``, empty otherwise.
+        tune: Whether to tune the shape if no saved result exists for it.
+        verbose: Whether to print progress while tuning.
+
+    Returns:
+        True if a kernel was prepared, False if this GPU's products need no preparation.
+
+    Raises:
+        RuntimeError: If ``weight`` is not on a CUDA device.
+    """
+    if _dispatch.arch(weight.device) == "sm120" and warpy.fits(weight, weight):
+        warpy.warmup(rows, weight, act, tune, verbose)
+        return True
+    return False
+
+
+def _gelu_slope(pre: torch.Tensor) -> torch.Tensor:
+    h = pre.float()
+    density = torch.exp(-0.5 * h * h) * 0.3989422804014327
+    return 0.5 * (1 + torch.erf(h * 0.7071067811865476)) + h * density
+
+
+def addmm_(
+    out: torch.Tensor, x: torch.Tensor, weight: torch.Tensor, transposed: bool = False
+) -> torch.Tensor:
+    """Add a matrix product to a buffer in place. Forward only.
+
+    Args:
+        out: Contiguous buffer with the dtype of ``x``, shape ``[M, N]``, or ``[M, K]`` if
+            ``transposed``.
+        x: Activations, shape ``[M, K]``, or ``[M, N]`` if ``transposed``.
+        weight: Weight, shape ``[N, K]``.
+        transposed: Whether to add ``x @ weight`` instead of ``x @ weight.T``.
+
+    Returns:
+        ``out``, now holding the sum.
+
+    Raises:
+        RuntimeError: If ``x`` is not on a CUDA device.
+    """
+    if _dispatch.arch(x.device) == "sm120" and warpy.fits_accum(x, weight, transposed):
+        return warpy.addmm_(out, x, weight, transposed)
+    return out.addmm_(x, weight if transposed else weight.T)
+
+
+def gelu_addmm_(
+    out: torch.Tensor, x: torch.Tensor, weight: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute ``gelu(out + x @ weight.T)`` with the exact erf GELU. Forward only.
+
+    Args:
+        out: Contiguous buffer holding the addend, shape ``[M, N]``. It is overwritten.
+        x: Activations, shape ``[M, K]``.
+        weight: Weight, shape ``[N, K]``.
+
+    Returns:
+        ``(post, pre)``: the result, and the sum the GELU was applied to. One of them reuses
+        ``out``.
+
+    Raises:
+        RuntimeError: If ``x`` is not on a CUDA device.
+    """
+    if _dispatch.arch(x.device) == "sm120" and warpy.fits_accum(x, weight):
+        return warpy.gelu_addmm_(out, x, weight)
+    pre = out.addmm_(x, weight.T)
+    return F.gelu(pre), pre
+
+
+def dgelu_addmm_(
+    out: torch.Tensor, g: torch.Tensor, weight: torch.Tensor, pre: torch.Tensor
+) -> torch.Tensor:
+    """Compute ``(out + g @ weight) * gelu'(pre)`` in place. Forward only.
+
+    This is the backward step through a GELU and the linear layer after it.
+
+    Args:
+        out: Contiguous buffer holding the addend, shape ``[M, K]``.
+        g: Gradient of the linear layer's output, shape ``[M, N]``.
+        weight: The linear layer's weight, shape ``[N, K]``.
+        pre: Input the GELU was applied to, shape ``[M, K]``.
+
+    Returns:
+        ``out``, now holding the gradient of ``pre``.
+
+    Raises:
+        RuntimeError: If ``g`` is not on a CUDA device.
+    """
+    if _dispatch.arch(g.device) == "sm120" and warpy.fits_accum(g, weight, True):
+        return warpy.dgelu_addmm_(out, g, weight, pre)
+    return out.addmm_(g, weight).mul_(_gelu_slope(pre).to(out.dtype))

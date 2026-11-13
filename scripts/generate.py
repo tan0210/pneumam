@@ -147,6 +147,16 @@ def load_pipeline(args: argparse.Namespace) -> Pipeline:
         decoder = Wan21Decoder.from_diffusers(parts.vae).requires_grad_(False)
         decoder = decoder.to(args.device, dtype).eval()
     text = TextEncoder.from_pipeline(parts)
+    if args.tune:
+        rows = 1 if args.cfg == 1.0 else 2
+        fused.warmup(
+            model,
+            rt,
+            args.height // 8,
+            args.width // 8,
+            rows * args.batch,
+            verbose=True,
+        )
     return Pipeline(model, text, decoder, rt, args.context_length)
 
 
@@ -166,6 +176,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     add_args(ap)
     ap.add_argument("--count", type=int, default=1, help="Number of images.")
+    ap.add_argument(
+        "--tune",
+        action="store_true",
+        help="Tune the GPU kernels for this size and batch first. Slow the first time, then cached.",
+    )
     ap.add_argument("--batch", type=int, default=1, help="Images denoised together.")
     ap.add_argument("--out", default="generate_out")
     args = ap.parse_args(argv)

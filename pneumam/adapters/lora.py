@@ -9,7 +9,7 @@ from safetensors.torch import save_file
 from torch import nn
 
 from ..ops.gemm import FP8Weight, fp8_supported, frozen_linear_fp8, quantize_weight
-from ..ops.lora import lora_add, lora_linear
+from ..ops.lora import lora_add, lora_linear, lora_mlp
 
 LORA_FORMAT = "pneumam-lora-1"
 _LEGACY = re.compile(
@@ -101,6 +101,36 @@ class LoRALinear(nn.Module):
         if self.base.bias is not None:
             out = out + self.base.bias
         return out.view(*lead, out.shape[-1])
+
+    def _operands(self, dtype: torch.dtype):
+        with torch.no_grad():
+            a = self.lora_A.to(dtype)
+            bs = (self.lora_B * self.scale).to(dtype)
+        return self.base.weight, self.lora_A, self.lora_B, a, bs, self.scale
+
+    def _plain(self) -> bool:
+        return (
+            isinstance(self.drop, nn.Identity)
+            and self.fp8 is None
+            and self.base.bias is None
+        )
+
+    def fused_mlp(self, down: nn.Module, x: torch.Tensor) -> torch.Tensor | None:
+        """Apply this layer, an exact erf GELU and another adapted layer as one step.
+
+        Args:
+            down: The layer after the GELU.
+            x: Input, shape ``[..., in_features]``.
+
+        Returns:
+            ``down(gelu(self(x)))``, or None if the two layers cannot be fused: ``down`` has no
+            adapter, or either layer uses dropout, a bias or an FP8 base.
+        """
+        if not (isinstance(down, LoRALinear) and self._plain() and down._plain()):
+            return None
+        flat = x.reshape(-1, x.shape[-1])
+        out = lora_mlp(flat, self._operands(flat.dtype), down._operands(flat.dtype))
+        return out.view(*x.shape[:-1], out.shape[-1])
 
     def delta_weight(self) -> torch.Tensor:
         """Weight update this adapter adds to the base weight.

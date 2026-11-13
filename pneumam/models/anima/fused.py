@@ -1,13 +1,17 @@
+from typing import Any, cast
+
 import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 from ...ops import attention as A
+from ...ops import gemm
 from ...ops.adaln import adaln, adaln_fp8, residual_adaln, residual_adaln_fp8
 from ...ops.gemm import (
     fp8_linear,
     fp8_linear_unscaled,
     fp8_supported,
+    linear,
     linear_gelu,
     mlp,
     quantize_weight,
@@ -35,10 +39,21 @@ def _attention_scales(model: AnimaDiT) -> list[dict[str, float]]:
     ]
 
 
+def _proj(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    if type(layer) is nn.Linear and layer.bias is None:
+        return linear(x, layer.weight)
+    return layer(x)  # an adapter
+
+
 def _mlp(b: nn.Module, hid: torch.Tensor) -> torch.Tensor:
     up, down = b.up, b.down
     if type(up) is nn.Linear and type(down) is nn.Linear:
         return mlp(hid, up.weight, down.weight)
+    both = getattr(up, "fused_mlp", None)
+    if both is not None:
+        y = both(down, hid)
+        if y is not None:
+            return y
     if type(up) is nn.Linear:
         return down(linear_gelu(hid, up.weight))  # type: ignore
     return down(nn.functional.gelu(up(hid)))  # type: ignore
@@ -55,26 +70,27 @@ def _block(
     ctx: Context,
     scales: dict[str, float] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    c, b = model.cfg, model.blocks[l]
-    q, k, v = qkv_norm_rope(b.qkv(hid), b.q_norm, b.k_norm, cos, sin, c.heads, c.qk_eps)  # type: ignore
+    c, b = model.cfg, cast(Any, model.blocks[l])
+    qkv = _proj(b.qkv, hid)
+    q, k, v = qkv_norm_rope(qkv, b.q_norm, b.k_norm, cos, sin, c.heads, c.qk_eps)
     if scales is None:
         att = A.attention(q, k, v)
     else:
         att = A.attention_fp8_grad(q, k, v, scales["q"], scales["k"])
     hid, z = residual_adaln(
-        b.o1(att),  # type: ignore
+        _proj(b.o1, att),  # type: ignore
         z,
         mod[l, 0, 2],
         mod[l, 1, 0],
         mod[l, 1, 1],
     )
-    q = head_norm(b.xq(hid), b.xq_norm, c.heads, c.qk_eps)  # type: ignore
+    q = head_norm(_proj(b.xq, hid), b.xq_norm, c.heads, c.qk_eps)  # type: ignore
     if scales is None:
         att = ctx.attend(l, q)
     else:
         att = A.attention_fp8_grad(q, *ctx.kv[l], scales["xq"], scales["xk"])
     hid, z = residual_adaln(
-        b.o2(att),  # type: ignore
+        _proj(b.o2, att),  # type: ignore
         z,
         mod[l, 1, 2],
         mod[l, 2, 0],
@@ -174,6 +190,50 @@ def enable_fp8(model: AnimaDiT, rt: Runtime, fast_accum: bool = False) -> None:
     rt.fp8_scales = _attention_scales(model)
     rt.fp8_fast_accum = fast_accum
     rt.graphs.clear()
+
+
+def warmup(
+    model: AnimaDiT,
+    rt: Runtime,
+    height: int,
+    width: int,
+    batch: int,
+    context_length: int | None = None,
+    tune: bool = True,
+    verbose: bool = False,
+) -> int:
+    """Prepare the GPU kernels for one latent size and batch size, tuning them where possible.
+
+    Tuned kernels are faster. Tuning a size for the first time on a GPU takes a while, and the
+    results are saved for later processes. Call it after ``enable_fp8`` to cover FP8 as well.
+
+    Args:
+        model: The model, on its final device.
+        rt: Its runtime.
+        height: Latent height.
+        width: Latent width.
+        batch: Latents per model evaluation. Guidance doubles it.
+        context_length: Padded text length, to also prepare FP8 cross-attention.
+        tune: Whether to tune kernels that have no saved result yet.
+        verbose: Whether to print progress while tuning.
+
+    Returns:
+        The number of kernels prepared. 0 means this GPU needs no preparation.
+    """
+    c, b = model.cfg, model.blocks[0]
+    device = model.patch.weight.device
+    tokens = (height // 2) * (width // 2)
+    rows, done = batch * tokens, 0
+    for name in FP8_LAYERS:
+        act = "gelu" if name == "up" else ""
+        done += gemm.warmup(rows, getattr(b, name).weight, act, tune, verbose)
+        if rt.fp8 is not None:
+            done += gemm.warmup(rows, rt.fp8[0][name].q, "", tune, verbose)
+    shape = (batch, c.heads, tokens)
+    done += A.warmup(*shape, tokens, c.head_dim, device, tune, verbose)
+    if context_length is not None:
+        done += A.warmup(*shape, context_length, c.head_dim, device, tune, verbose)
+    return done
 
 
 def disable_fp8(rt: Runtime) -> None:
