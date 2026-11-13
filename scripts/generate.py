@@ -9,11 +9,11 @@ from safetensors.torch import load_file
 
 from pneumam import models
 from pneumam.adapters.lora import merge_lora, read_lora
-from pneumam.components.vae import Wan21Decoder, load_decoder
 from pneumam.models.anima import fused
 from pneumam.models.anima.convert import convert_lora
 from pneumam.models.anima.dit import AnimaDiT
 from pneumam.models.anima.text import TextEncoder
+from pneumam.models.vae import Wan21Decoder, load_decoder
 from pneumam.pipeline import Pipeline, to_uint8
 from pneumam.runtime import Runtime
 from pneumam.sampling.loop import SAMPLERS
@@ -58,12 +58,14 @@ def add_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--fp8-fast-accum", action="store_true")
     ap.add_argument(
         "--trim-context",
-        action="store_true",
-        help="Skip padded text tokens in cross-attention where that is faster.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip padded text tokens in cross-attention. It does not change the image.",
     )
     ap.add_argument(
         "--graph",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Replay each step and the decode as CUDA graphs. The first batch captures them.",
     )
     ap.add_argument(

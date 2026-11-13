@@ -7,7 +7,7 @@ from .._fp8 import FP8, FP8Weight, quantize_weight  # noqa: F401
 _ROW_CONFIGS = [triton.Config({}, num_warps=nw) for nw in (4, 8, 16)]
 
 
-@triton.autotune(configs=_ROW_CONFIGS, key=["D"])
+@triton.autotune(configs=_ROW_CONFIGS, key=["D"], cache_results=True)
 @triton.jit
 def _residual_adaln_fp8_kernel(
     x_ptr,
@@ -18,11 +18,14 @@ def _residual_adaln_fp8_kernel(
     q_ptr,
     s_ptr,
     z_ptr,
+    xr_ptr,
+    xc_ptr,
     S,
     eps,
     D: tl.constexpr,
     BLOCK: tl.constexpr,
     HAS_X: tl.constexpr,
+    X_SCALED: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     batch = row // S
@@ -32,6 +35,9 @@ def _residual_adaln_fp8_kernel(
     res = tl.load(res_ptr + off, mask=mask, other=0.0)
     if HAS_X:
         x = tl.load(x_ptr + off, mask=mask, other=0.0).to(tl.float32)
+        if X_SCALED:
+            xc = tl.load(xc_ptr + cols, mask=mask, other=0.0)
+            x = x * tl.load(xr_ptr + row) * xc
         g = tl.load(gate_ptr + batch * D + cols, mask=mask, other=0.0).to(tl.float32)
         prod = (g * x).to(res_ptr.dtype.element_ty).to(tl.float32)
         z = (res.to(tl.float32) + prod).to(res_ptr.dtype.element_ty)
@@ -59,11 +65,14 @@ def _residual_adaln_fp8(
     shift: torch.Tensor,
     scale: torch.Tensor,
     eps: float,
+    x_rows: torch.Tensor | None,
+    x_cols: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, S, D = residual.shape
     q = torch.empty(B, S, D, dtype=FP8, device=residual.device)
     s = torch.empty(B * S, 1, dtype=torch.float32, device=residual.device)
     z = torch.empty_like(residual)
+    scaled = x_rows is not None and x_cols is not None
     _residual_adaln_fp8_kernel[(B * S,)](
         x,
         residual,
@@ -73,17 +82,20 @@ def _residual_adaln_fp8(
         q,
         s,
         z,
+        x_rows if scaled else s,
+        x_cols if scaled else s,
         S,
         eps,
         D=D,
         BLOCK=triton.next_power_of_2(D),
         HAS_X=True,
+        X_SCALED=scaled,
     )
     return q, s, z
 
 
 @_residual_adaln_fp8.register_fake
-def _(x, residual, gate, shift, scale, eps):
+def _(x, residual, gate, shift, scale, eps, x_rows, x_cols):
     B, S, D = residual.shape
     return (
         torch.empty(B, S, D, dtype=FP8, device=residual.device),
@@ -108,11 +120,14 @@ def _adaln_fp8(
         q,
         s,
         z,
+        s,
+        s,
         S,
         eps,
         D=D,
         BLOCK=triton.next_power_of_2(D),
         HAS_X=False,
+        X_SCALED=False,
     )
     return q, s
 
@@ -133,6 +148,7 @@ def residual_adaln_fp8(
     shift: torch.Tensor,
     scale: torch.Tensor,
     eps: float = 1e-6,
+    x_scales: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``residual_adaln`` whose modulated output is returned as FP8 with a scale per token.
 
@@ -143,6 +159,8 @@ def residual_adaln_fp8(
         shift: Shift, shape ``[B, D]``.
         scale: Scale (already including the +1), shape ``[B, D]``.
         eps: LayerNorm epsilon.
+        x_scales: Float32 ``(rows, cols)`` of shapes ``[B * S, 1]`` and ``[D]``. If given, the
+            sub-layer output is ``x * rows * cols``.
 
     Returns:
         ``(q, s, z)``: the FP8 output ``[B, S, D]``, its float32 token scales ``[B * S, 1]``, and the
@@ -160,6 +178,7 @@ def residual_adaln_fp8(
         shift.contiguous(),
         scale.contiguous(),
         eps,
+        *(x_scales or (None, None)),
     )
 
 
@@ -219,20 +238,25 @@ def _gelu(x):
     return 0.5 * x * (1.0 + tl.where(z < 0, -y, y))
 
 
-@triton.autotune(configs=_ROW_CONFIGS, key=["K"])
+@triton.autotune(configs=_ROW_CONFIGS, key=["K"], cache_results=True)
 @triton.jit
 def _rowquant_kernel(
     x_ptr,
     q_ptr,
     s_ptr,
+    r_ptr,
+    c_ptr,
     K: tl.constexpr,
     BLOCK: tl.constexpr,
     GELU: tl.constexpr,
+    SCALED: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
     mask = cols < K
     x = tl.load(x_ptr + row * K + cols, mask=mask, other=0.0).to(tl.float32)
+    if SCALED:
+        x = x * tl.load(r_ptr + row) * tl.load(c_ptr + cols, mask=mask, other=0.0)
     if GELU:
         x = _gelu(x)
     row_scale = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-12) / 448.0
@@ -242,16 +266,32 @@ def _rowquant_kernel(
 
 
 @torch.library.custom_op("pneumam::rowquant", mutates_args=())
-def _rowquant(x: torch.Tensor, gelu: bool) -> tuple[torch.Tensor, torch.Tensor]:
+def _rowquant(
+    x: torch.Tensor,
+    gelu: bool,
+    rows: torch.Tensor | None,
+    cols: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     B, S, K = x.shape
     q = torch.empty(B, S, K, dtype=FP8, device=x.device)
     s = torch.empty(B * S, 1, dtype=torch.float32, device=x.device)
-    _rowquant_kernel[(B * S,)](x, q, s, K=K, BLOCK=triton.next_power_of_2(K), GELU=gelu)
+    scaled = rows is not None and cols is not None
+    _rowquant_kernel[(B * S,)](
+        x,
+        q,
+        s,
+        rows if scaled else s,
+        cols if scaled else s,
+        K=K,
+        BLOCK=triton.next_power_of_2(K),
+        GELU=gelu,
+        SCALED=scaled,
+    )
     return q, s
 
 
 @_rowquant.register_fake
-def _(x, gelu):
+def _(x, gelu, rows, cols):
     B, S, K = x.shape
     return (
         torch.empty(B, S, K, dtype=FP8, device=x.device),
@@ -259,15 +299,55 @@ def _(x, gelu):
     )
 
 
-def rowquant(x: torch.Tensor, gelu: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+def rowquant(
+    x: torch.Tensor,
+    gelu: bool = False,
+    scales: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize tokens to FP8 with a scale per token, optionally applying GELU first.
 
     Args:
         x: Tokens, shape ``[B, S, K]``.
         gelu: Apply GELU before quantizing. It is within 1e-6 of the exact erf GELU.
+        scales: Float32 ``(rows, cols)`` of shapes ``[B * S, 1]`` and ``[K]``. If given, the
+            tokens are ``x * rows * cols``.
 
     Returns:
         ``(q, s)``: the FP8 tokens ``[B, S, K]`` and their float32 scales ``[B * S, 1]``.
         See ``fp8_linear``.
     """
-    return _rowquant(x.contiguous(), gelu)
+    return _rowquant(x.contiguous(), gelu, *(scales or (None, None)))
+
+
+@triton.autotune(configs=_ROW_CONFIGS, key=["K"], cache_results=True)
+@triton.jit
+def _scale_kernel(x_ptr, r_ptr, c_ptr, K: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < K
+    x = tl.load(x_ptr + row * K + cols, mask=mask, other=0.0).to(tl.float32)
+    y = x * tl.load(r_ptr + row) * tl.load(c_ptr + cols, mask=mask, other=0.0)
+    tl.store(x_ptr + row * K + cols, y.to(x_ptr.dtype.element_ty), mask=mask)
+
+
+@torch.library.custom_op("pneumam::scale_rows_cols_", mutates_args=("x",))
+def _scale(x: torch.Tensor, rows: torch.Tensor, cols: torch.Tensor) -> None:
+    M, K = x.shape
+    _scale_kernel[(M,)](x, rows, cols, K=K, BLOCK=triton.next_power_of_2(K))
+
+
+def scale_rows_cols_(
+    x: torch.Tensor, rows: torch.Tensor, cols: torch.Tensor
+) -> torch.Tensor:
+    """Multiply a matrix by a scale per row and a scale per column, in place.
+
+    Args:
+        x: Contiguous matrix, shape ``[M, K]``.
+        rows: Float32 row scales, shape ``[M, 1]``.
+        cols: Float32 column scales, shape ``[K]``.
+
+    Returns:
+        ``x``, now holding ``x * rows * cols``.
+    """
+    _scale(x, rows.contiguous(), cols.contiguous())
+    return x

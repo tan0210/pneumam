@@ -36,6 +36,7 @@ def _offset(row, H, W, C, SHUF: tl.constexpr):
     configs=_CONFIGS,
     key=["C", "HAS_R", "SHUF"],
     prune_configs_by={"early_config_prune": _prune},
+    cache_results=True,
 )
 @triton.jit
 def _fwd_kernel(
@@ -78,6 +79,7 @@ def _fwd_kernel(
     configs=_CONFIGS,
     key=["C", "ROWS", "HAS_GS", "SHUF"],
     prune_configs_by={"early_config_prune": _prune},
+    cache_results=True,
 )
 @triton.jit
 def _bwd_kernel(

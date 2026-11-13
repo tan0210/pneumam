@@ -64,7 +64,9 @@ def _section(
     tl.store(dst + HALF, out_b.to(dst_ptr.dtype.element_ty), mask=mask)
 
 
-@triton.autotune(configs=_HEAD_CONFIGS, key=["HEADS", "HALF", "FP8"])
+@triton.autotune(
+    configs=_HEAD_CONFIGS, key=["HEADS", "HALF", "FP8"], cache_results=True
+)
 @triton.jit
 def _qkv_norm_rope_kernel(
     qkv_ptr,
@@ -159,7 +161,9 @@ def _qkv_norm_rope_kernel(
         )
 
 
-@triton.autotune(configs=_HEAD_CONFIGS, key=["HEADS", "HALF", "FP8"])
+@triton.autotune(
+    configs=_HEAD_CONFIGS, key=["HEADS", "HALF", "FP8"], cache_results=True
+)
 @triton.jit
 def _head_norm_kernel(
     x_ptr,
@@ -384,7 +388,9 @@ def _section_bwd(
     return tl.sum(da * xa, axis=0), tl.sum(db * xb, axis=0)
 
 
-@triton.autotune(configs=_BWD_CONFIGS, key=["HEADS", "HALF", "ROWS"])
+@triton.autotune(
+    configs=_BWD_CONFIGS, key=["HEADS", "HALF", "ROWS"], cache_results=True
+)
 @triton.jit
 def _qkv_norm_rope_bwd_kernel(
     qkv_ptr,
@@ -498,7 +504,9 @@ def _qkv_norm_rope_bwd_kernel(
             tl.store(out + HALF + dim, acc_b)
 
 
-@triton.autotune(configs=_BWD_CONFIGS, key=["HEADS", "HALF", "ROWS"])
+@triton.autotune(
+    configs=_BWD_CONFIGS, key=["HEADS", "HALF", "ROWS"], cache_results=True
+)
 @triton.jit
 def _head_norm_bwd_kernel(
     x_ptr,

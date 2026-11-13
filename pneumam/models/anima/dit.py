@@ -328,9 +328,8 @@ class AnimaDiT(nn.Module):
         c = self.cfg
         B, S, _ = ctx.shape
         fp8 = rt.fp8 is not None and is_experimental_fp8_attention()
-        probe = ctx.new_empty((0, 0, c.heads, c.head_dim))
         seqused = ln_pad = None
-        if rt.trim_context and not torch.is_grad_enabled() and A.trims_fast(probe, fp8):
+        if rt.trim_context and not torch.is_grad_enabled():
             index = torch.arange(1, S + 1, device=ctx.device)
             lengths = ((ctx != 0).any(-1) * index).amax(1).clamp_min(1)
             keep = min(S, (int(lengths.max()) + 7) // 8 * 8)

@@ -7,7 +7,7 @@ from .common import tuned_rows
 _ROW_CONFIGS = [triton.Config({}, num_warps=nw) for nw in (4, 8, 16)]
 
 
-@triton.autotune(configs=_ROW_CONFIGS, key=["D"])
+@triton.autotune(configs=_ROW_CONFIGS, key=["D"], cache_results=True)
 @triton.jit
 def _residual_adaln_kernel(
     x_ptr,
@@ -108,7 +108,7 @@ def _(z, shift, scale, eps):
     return torch.empty_like(z)
 
 
-@triton.autotune(configs=_ROW_CONFIGS, key=["D", "ROWS"])
+@triton.autotune(configs=_ROW_CONFIGS, key=["D", "ROWS"], cache_results=True)
 @triton.jit
 def _residual_adaln_bwd_kernel(
     gh_ptr,

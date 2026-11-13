@@ -12,7 +12,6 @@ __all__ = [
     "cross_attention_trimmed",
     "cross_attention_trimmed_quantized",
     "to_fp8",
-    "trims_fast",
     "wide_attention",
 ]
 
@@ -115,24 +114,6 @@ def attention_quantized(
     return attention(*_dequantize(q, k, v, q_scale, k_scale, v_scale))
 
 
-def trims_fast(q: torch.Tensor, fp8: bool = False) -> bool:
-    """Tell whether trimming the context speeds up cross-attention for inputs like ``q``.
-
-    Args:
-        q: Representative attention input, shape ``[B, S, H, hd]``.
-        fp8: Whether the attention will run on FP8 operands.
-            See ``cross_attention_trimmed_quantized``.
-
-    Returns:
-        True if ``cross_attention_trimmed`` skips the trimmed keys. If False it still returns the
-        right result, but is slower than ``attention`` over the padded context.
-
-    Raises:
-        RuntimeError: If ``q`` is not on a CUDA device.
-    """
-    return _flash(q) or (fp8 and _warpy(q))
-
-
 def cross_attention_trimmed(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -145,7 +126,8 @@ def cross_attention_trimmed(
     """Cross-attention over a trimmed context, corrected for the padding that was removed.
 
     Only the first ``seqused_k[b]`` keys of batch item ``b`` are attended. The output matches
-    attention over the full context when the removed keys and values were all zero. Forward only.
+    attention over the full context when the removed keys and values were all zero. It costs
+    less than attention over the full context on every GPU. Forward only.
 
     Args:
         q: Queries, shape ``[B, Sq, H, hd]``.
@@ -166,8 +148,11 @@ def cross_attention_trimmed(
         out, lse = warpy.attention_trimmed(q, k, v, seqused_k, rescale)
     elif _flash(q):
         out, lse = flash_attn.attention_trimmed(q, k, v, seqused_k)
-    else:
+    elif _dispatch.arch(q.device) == "reference":
         out, lse = reference.attention_trimmed(q, k, v, seqused_k)
+    else:
+        out = reference.attention_trimmed_biased(q, k, v, seqused_k, ln_pad)
+        return out.flatten(2)
     return _ctx_scale(out, lse, ln_pad).flatten(2)
 
 

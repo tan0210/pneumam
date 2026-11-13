@@ -245,17 +245,30 @@ def _rowquant(x):
     return q, s.reshape(B * S, 1)
 
 
-def rowquant(x: torch.Tensor, gelu: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+def _scaled(x, scales):
+    if scales is None:
+        return x
+    rows, cols = scales
+    return x.float() * rows.view(*x.shape[:-1], 1) * cols
+
+
+def rowquant(
+    x: torch.Tensor,
+    gelu: bool = False,
+    scales: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize tokens to FP8 with a scale per token, optionally applying GELU first.
 
     Args:
         x: Tokens, shape ``[B, S, K]``.
         gelu: Apply the exact erf GELU before quantizing.
+        scales: Float32 ``(rows, cols)`` of shapes ``[B * S, 1]`` and ``[K]``. If given, the
+            tokens are ``x * rows * cols``.
 
     Returns:
         ``(q, s)``: the FP8 tokens ``[B, S, K]`` and their float32 scales ``[B * S, 1]``.
     """
-    x = x.float()
+    x = _scaled(x, scales).float()
     return _rowquant(F.gelu(x) if gelu else x)
 
 
@@ -283,6 +296,7 @@ def residual_adaln_fp8(
     shift: torch.Tensor,
     scale: torch.Tensor,
     eps: float = 1e-6,
+    x_scales: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``residual_adaln`` whose modulated output is returned as FP8 with a scale per token.
 
@@ -293,12 +307,14 @@ def residual_adaln_fp8(
         shift: Shift, shape ``[B, D]``.
         scale: Scale (already including the +1), shape ``[B, D]``.
         eps: LayerNorm epsilon.
+        x_scales: Float32 ``(rows, cols)`` of shapes ``[B * S, 1]`` and ``[D]``. If given, the
+            sub-layer output is ``x * rows * cols``.
 
     Returns:
         ``(q, s, z)``: the FP8 output ``[B, S, D]``, its float32 token scales ``[B * S, 1]``, and the
         updated residual stream ``z`` ``[B, S, D]`` in the input dtype.
     """
-    z = _residual(x, residual, gate)
+    z = _residual(_scaled(x, x_scales), residual, gate)
     return (*_rowquant(_adaln(z, shift, scale, eps)), z)
 
 
@@ -319,6 +335,20 @@ def fp8_linear(
     B, S, K = q.shape
     a = q.float().view(B * S, K) * s
     return (a @ (w.q.float() * w.s[:, None]).T).to(torch.bfloat16).view(B, S, -1)
+
+
+def fp8_gemm(q: torch.Tensor, w: FP8Weight) -> torch.Tensor:
+    """Multiply FP8 tokens by an FP8 weight without applying either scale.
+
+    Args:
+        q: FP8 tokens, shape ``[B, S, K]``.
+        w: Quantized weight, shape ``[N, K]``.
+
+    Returns:
+        bfloat16 product of the stored values, shape ``[B, S, N]``. Multiply it by the token
+        scales and by ``w.s`` to get the true product.
+    """
+    return (q.float() @ w.q.float().T).to(torch.bfloat16)
 
 
 def linear_gelu(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -388,6 +418,40 @@ def attention_trimmed(
     lse = scores.logsumexp(-1)
     out = torch.einsum("bhqk,bkhd->bqhd", scores.softmax(-1), v.float())
     return out.to(q.dtype), lse
+
+
+def attention_trimmed_biased(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seqused_k: torch.Tensor,
+    ln_pad: torch.Tensor,
+) -> torch.Tensor:
+    """Attention over a trimmed context that stands in for the removed zero padding.
+
+    The result equals attention over the first ``seqused_k[b]`` keys extended with ``P`` zero
+    keys and zero values.
+
+    Args:
+        q: Queries, shape ``[B, Sq, H, hd]``.
+        k: Keys, shape ``[B, Sk, H, hd]``.
+        v: Values, shape ``[B, Sk, H, hd]``.
+        seqused_k: Valid key count per batch item, shape ``[B]``.
+        ln_pad: ``log(P)`` per batch item, ``-inf`` where nothing was trimmed, shape ``[B]``.
+
+    Returns:
+        Attention output, shape ``[B, Sq, H, hd]``, dtype of ``q``.
+    """
+    B, Sk = k.shape[:2]
+    valid = torch.arange(Sk, device=k.device)[None] < seqused_k[:, None]
+    bias = torch.zeros(B, Sk + 1, dtype=torch.float32, device=k.device)
+    bias[:, :Sk].masked_fill_(~valid, float("-inf"))
+    bias[:, Sk] = ln_pad.float()  # one zero key weighted like P of them
+    one = (0, 0, 0, 0, 0, 1)
+    kt, vt = F.pad(k, one).transpose(1, 2), F.pad(v, one).transpose(1, 2)
+    mask = bias[:, None, None, :].to(q.dtype)
+    out = F.scaled_dot_product_attention(q.transpose(1, 2), kt, vt, attn_mask=mask)
+    return out.transpose(1, 2)
 
 
 def ctx_scale(

@@ -44,7 +44,6 @@ def test_fp8_attention_falls_back_without_a_kernel(qkv):
     q, k, v = qkv
     want = attention.attention(q, k, v)
     assert torch.equal(attention.attention_fp8(q, k, v, rescale=False), want)
-    assert not attention.trims_fast(q) and not attention.trims_fast(q, fp8=True)
 
 
 def test_quantized_attention_recovers_true_units(qkv):
@@ -74,6 +73,21 @@ def test_trimmed_cross_attention(qkv):
     assert rel(got, want) < 0.1
 
 
+def test_trimmed_cross_attention_without_a_trimming_kernel(qkv, monkeypatch):
+    q = qkv[0]
+    Sk, full = 8, 20
+    used = torch.tensor([5, 8], dtype=torch.int32)
+    keep = (torch.arange(Sk)[None] < used[:, None])[:, :, None, None]
+    k, v = torch.randn(B, Sk, H, hd) * keep, torch.randn(B, Sk, H, hd) * keep
+    pad = (0, 0, 0, 0, 0, full - Sk)
+    ln_pad = torch.log((full - used).float())
+    want = attention.attention(q, F.pad(k, pad), F.pad(v, pad))
+    monkeypatch.setattr(attention._dispatch, "arch", lambda device: "sm89")
+    monkeypatch.setattr(attention.flash_attn, "fits", lambda q: False)
+    got = attention.cross_attention_trimmed(q, k, v, used, ln_pad)
+    assert got.shape == want.shape and maxerr(got, want) < 1e-5
+
+
 def test_wide_attention():
     q = torch.randn(B, 1, S, 384)
     want = F.scaled_dot_product_attention(q, q, q)
@@ -87,6 +101,41 @@ def test_gemm_ops(x):
     assert maxerr(gemm.mlp(x, w1, w2), F.gelu(x @ w1.T) @ w2.T) < 1e-3
     fw = gemm.quantize_weight(w1)
     assert rel(gemm.fp8_linear(*gemm.rowquant(x), fw), x @ w1.T) < 0.05
+
+
+def test_unscaled_fp8_product_carries_its_scales(x):
+    w = torch.randn(128, D)
+    fw = gemm.quantize_weight(w)
+    q, s = gemm.rowquant(x)
+    y, scales = gemm.fp8_linear_unscaled(q, s, fw)
+    assert scales is not None
+    true = y.float() * scales[0].view(B, S, 1) * scales[1]
+    assert rel(true, x @ w.T) < 0.05
+    assert rel(gemm.fp8_linear(q, s, fw), true) < 1e-2
+    plain = gemm.rowquant(true, gelu=True)
+    folded = gemm.rowquant(y, gelu=True, scales=scales)
+    assert (
+        rel(
+            folded[0].float() * folded[1].view(B, S, 1),
+            plain[0].float() * plain[1].view(B, S, 1),
+        )
+        < 1e-2
+    )
+
+
+def test_residual_adaln_fp8_applies_pending_scales(x):
+    sh, sc, g = torch.randn(3, B, D).unbind(0)
+    rows, cols = torch.rand(B * S, 1) + 0.5, torch.rand(D) + 0.5
+    want = adaln.residual_adaln_fp8(x * rows.view(B, S, 1) * cols, x, g, sh, sc)
+    got = adaln.residual_adaln_fp8(x, x, g, sh, sc, x_scales=(rows, cols))
+    assert maxerr(got[2], want[2]) < 1e-5
+    assert (
+        rel(
+            got[0].float() * got[1].view(B, S, 1),
+            want[0].float() * want[1].view(B, S, 1),
+        )
+        < 1e-2
+    )
 
 
 def test_linear_is_differentiable(x):
@@ -124,3 +173,35 @@ def test_warpy_pads_rows_to_whole_blocks():
     assert torch.equal(p8[:24].float(), q.float())
     full = torch.randn(128, 64).to(torch.bfloat16)
     assert warpy._pad_rows(full).shape == (128, 64)
+
+
+@pytest.mark.parametrize("rows", [128, 300, 100, 384])
+def test_warpy_runs_whole_blocks_in_place_and_pads_only_the_tail(rows, monkeypatch):
+    launches = []
+
+    def fake_gemm(a, w, out=None, act="", **config):
+        assert a.shape[0] % 128 == 0 and a.is_contiguous()
+        launches.append((a.shape[0], out is not None))
+        y = a.float() @ w.float().T
+        if out is None:
+            out = torch.empty(a.shape[0], w.shape[0], dtype=a.dtype)
+        out.copy_(torch.nn.functional.gelu(y) if act == "gelu" else y)
+        return (out, None) if act == "gelu" else out
+
+    monkeypatch.setattr(warpy, "_wk", type("W", (), {"gemm": staticmethod(fake_gemm)}))
+    monkeypatch.setattr(warpy, "_key", lambda a, w, act: "k")
+    a, w = (
+        torch.randn(rows, 64).to(torch.bfloat16),
+        torch.randn(128, 64).to(torch.bfloat16),
+    )
+    for act in ("", "gelu"):
+        launches.clear()
+        y = a.float() @ w.float().T
+        want = torch.nn.functional.gelu(y) if act == "gelu" else y
+        got = warpy._run(a, w, act)
+        assert got.shape == (rows, 128) and maxerr(got, want.to(torch.bfloat16)) < 1e-6
+        whole, tail = rows // 128 * 128, rows % 128
+        expect = ([(whole, tail > 0)] if whole else []) + (
+            [(128, False)] if tail else []
+        )
+        assert launches == expect

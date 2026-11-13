@@ -3,8 +3,8 @@ import os
 
 import torch
 
-from pneumam.components.vae import Wan21Decoder, Wan21Encoder, save_vae
 from pneumam.models.anima.convert import convert_checkpoint
+from pneumam.models.vae import Wan21Decoder, Wan21Encoder, save_vae
 
 REPO = "circlestone-labs/Anima-Base-v1.0-Diffusers"
 

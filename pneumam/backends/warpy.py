@@ -50,7 +50,7 @@ def fits(x: torch.Tensor, *weights: torch.Tensor) -> bool:
 
 def _key(a: torch.Tensor, w: torch.Tensor, act: str) -> str:
     gpu = torch.cuda.get_device_name(a.device)
-    m = -(-a.shape[0] // _BM) * _BM
+    m = max(a.shape[0] // _BM, 1) * _BM  # the rows of the main launch
     return f"{gpu}|{a.dtype}|m={m}|n={w.shape[0]}|k={w.shape[1]}|act={act}"
 
 
@@ -88,11 +88,23 @@ def _pad_rows(a: torch.Tensor) -> torch.Tensor:
     return buf.view(a.dtype)
 
 
+def _launch(a, w, act, out=None) -> torch.Tensor:
+    y = _wk.gemm(a, w, out=out, act=act, **_tuned_config(_key(a, w, act)))  # type: ignore
+    return y[0] if act == "gelu" else y  # type: ignore
+
+
 def _run(a: torch.Tensor, w: torch.Tensor, act: str = "") -> torch.Tensor:
     m = a.shape[0]
-    out = _wk.gemm(_pad_rows(a), w, act=act, **_tuned_config(_key(a, w, act)))  # type: ignore
-    y: torch.Tensor = out[0] if act == "gelu" else out  # type: ignore
-    return y[:m]
+    a = a.contiguous()
+    whole = m // _BM * _BM
+    if whole == m:
+        return _launch(a, w, act)
+    dtype = torch.bfloat16 if a.dtype == FP8 else a.dtype
+    y = torch.empty(m, w.shape[0], dtype=dtype, device=a.device)
+    if whole:
+        _launch(a[:whole], w, act, y[:whole])  # the bulk runs in place, uncopied
+    y[whole:] = _launch(_pad_rows(a[whole:]), w, act)[: m - whole]
+    return y
 
 
 @torch.library.custom_op("pneumam::gemm_warpy", mutates_args=())
@@ -129,17 +141,13 @@ def _(a, w):
     return a.new_empty(a.shape[0], w.shape[0])
 
 
-@torch.library.custom_op("pneumam::fp8_linear_warpy", mutates_args=())
-def _fp8_linear(
-    q: torch.Tensor, s: torch.Tensor, wq: torch.Tensor, ws: torch.Tensor
-) -> torch.Tensor:
-    out = _run(q, wq)
-    # warpy takes one scale per operand, so the token and channel scales go on afterwards
-    return out.mul_(s).mul_(ws)
+@torch.library.custom_op("pneumam::fp8_gemm_warpy", mutates_args=())
+def _fp8_gemm(q: torch.Tensor, wq: torch.Tensor) -> torch.Tensor:
+    return _run(q, wq)
 
 
-@_fp8_linear.register_fake
-def _(q, s, wq, ws):
+@_fp8_gemm.register_fake
+def _(q, wq):
     return torch.empty(q.shape[0], wq.shape[0], dtype=torch.bfloat16, device=q.device)
 
 
@@ -171,6 +179,21 @@ def linear_gelu(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return y.view(*x.shape[:-1], weight.shape[0])
 
 
+def fp8_gemm(q: torch.Tensor, w: FP8Weight) -> torch.Tensor:
+    """Multiply FP8 tokens by an FP8 weight without applying either scale. Forward only.
+
+    Args:
+        q: FP8 tokens, shape ``[B, S, K]``.
+        w: Quantized weight accepted by ``fits(q, w.q)``, shape ``[N, K]``.
+
+    Returns:
+        bfloat16 product of the stored values, shape ``[B, S, N]``. Multiply it by the token
+        scales and by ``w.s`` to get the true product.
+    """
+    B, S, K = q.shape
+    return _fp8_gemm(q.reshape(B * S, K), w.q).view(B, S, -1)
+
+
 def fp8_linear(
     q: torch.Tensor, s: torch.Tensor, w: FP8Weight, fast_accum: bool = False
 ) -> torch.Tensor:
@@ -185,8 +208,9 @@ def fp8_linear(
     Returns:
         bfloat16 result, shape ``[B, S, N]``.
     """
-    B, S, K = q.shape
-    return _fp8_linear(q.reshape(B * S, K), s, w.q, w.s.view(1, -1)).view(B, S, -1)
+    B, S, _ = q.shape
+    y = fp8_gemm(q, w).view(B * S, -1)
+    return y.mul_(s).mul_(w.s.view(1, -1)).view(B, S, -1)
 
 
 def warmup(
@@ -225,7 +249,8 @@ def warmup(
     ).view(weight.dtype)
     key = _key(a, weight, act)
     if tune and not _tuned_config(key):
-        best, _ = _wk.autotune_gemm(_pad_rows(a), weight, verbose=verbose, act=act)  # type: ignore
+        bulk = a[: rows // _BM * _BM] if rows >= _BM else _pad_rows(a)
+        best, _ = _wk.autotune_gemm(bulk, weight, verbose=verbose, act=act)  # type: ignore
         _store_config(key, best)
     _run(a, weight, act)
     torch.cuda.synchronize(weight.device)

@@ -15,6 +15,7 @@ if available:
         quantize_weight,
         residual_adaln_fp8,
         rowquant,
+        scale_rows_cols_,
     )
     from .rms import add_rms_silu, rms_silu, shuffle_rms_silu
     from .rope import head_norm, head_norm_fp8, qkv_norm_rope, qkv_norm_rope_fp8
@@ -36,5 +37,6 @@ if available:
         "residual_adaln_fp8",
         "rms_silu",
         "rowquant",
+        "scale_rows_cols_",
         "shuffle_rms_silu",
     ]

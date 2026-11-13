@@ -108,6 +108,29 @@ def test_trimmed_attention_matches_attention_over_zero_padding():
     assert maxerr(got, R.attention(q, F.pad(k, pad), F.pad(v, pad))) < 1e-5
 
 
+def test_biased_trimmed_attention_matches_attention_over_zero_padding():
+    Sk, full = 8, 20
+    q = torch.randn(B, S, H, hd)
+    used = torch.tensor([5, 8], dtype=torch.int32)
+    keep = (torch.arange(Sk)[None] < used[:, None])[:, :, None, None]
+    k, v = torch.randn(B, Sk, H, hd) * keep, torch.randn(B, Sk, H, hd) * keep
+    pad = (0, 0, 0, 0, 0, full - Sk)
+    want = R.attention(q, F.pad(k, pad), F.pad(v, pad))
+    ln_pad = torch.log((full - used).float())
+    assert maxerr(R.attention_trimmed_biased(q, k, v, used, ln_pad), want) < 1e-5
+    junk = torch.randn(B, Sk, H, hd)  # keys past the valid count must not matter
+    got = R.attention_trimmed_biased(q, torch.where(keep, k, junk), v, used, ln_pad)
+    assert maxerr(got, want) < 1e-5
+    whole = torch.tensor([Sk, Sk], dtype=torch.int32)
+    k, v = torch.randn(2, B, Sk, H, hd).unbind(0)
+    got = R.attention_trimmed_biased(q, k, v, whole, torch.log(torch.zeros(B)))
+    assert maxerr(got, R.attention(q, k, v)) < 1e-5
+    half = R.attention_trimmed_biased(
+        q.bfloat16(), k.bfloat16(), v.bfloat16(), whole, ln_pad
+    )
+    assert half.dtype == torch.bfloat16 and half.isfinite().all()
+
+
 def test_ctx_scale_without_padding_is_the_identity():
     q, k, v = torch.randn(3, B, S, H, hd).unbind(0)
     out, lse = R.attention_trimmed(q, k, v, torch.tensor([S, S], dtype=torch.int32))

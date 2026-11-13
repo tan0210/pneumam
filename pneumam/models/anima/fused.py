@@ -6,6 +6,7 @@ from ...ops import attention as A
 from ...ops.adaln import adaln, adaln_fp8, residual_adaln, residual_adaln_fp8
 from ...ops.gemm import (
     fp8_linear,
+    fp8_linear_unscaled,
     fp8_supported,
     linear_gelu,
     mlp,
@@ -205,13 +206,9 @@ def forward_fp8(
             att = A.attention_quantized(q, k, v, s["q"], s["k"])
         else:
             att = A.attention(*qkv_norm_rope(qkv, *rope, c.qk_eps))  # type: ignore
-        oq, os_ = rowquant(att)
+        o, sc = fp8_linear_unscaled(*rowquant(att), w["o1"], fast)
         hq, hs, z = residual_adaln_fp8(
-            fp8_linear(oq, os_, w["o1"], fast),
-            z,
-            mod[l, 0, 2],
-            mod[l, 1, 0],
-            mod[l, 1, 1],
+            o, z, mod[l, 0, 2], mod[l, 1, 0], mod[l, 1, 1], x_scales=sc
         )
         xq = fp8_linear(hq, hs, w["xq"], fast)
         if quantized:
@@ -219,20 +216,19 @@ def forward_fp8(
             att = ctx.attend_quantized(l, q, s["xq"])
         else:
             att = ctx.attend(l, head_norm(xq, b.xq_norm, c.heads, c.qk_eps))  # type: ignore
-        oq, os_ = rowquant(att)
+        o, sc = fp8_linear_unscaled(*rowquant(att), w["o2"], fast)
         hq, hs, z = residual_adaln_fp8(
-            fp8_linear(oq, os_, w["o2"], fast),
-            z,
-            mod[l, 1, 2],
-            mod[l, 2, 0],
-            mod[l, 2, 1],
+            o, z, mod[l, 1, 2], mod[l, 2, 0], mod[l, 2, 1], x_scales=sc
         )
-        gq, gs = rowquant(fp8_linear(hq, hs, w["up"], fast), gelu=True)
-        y = fp8_linear(gq, gs, w["down"], fast)
+        up, sc = fp8_linear_unscaled(hq, hs, w["up"], fast)
+        gq, gs = rowquant(up, gelu=True, scales=sc)
         if l + 1 < c.layers:
+            y, sc = fp8_linear_unscaled(gq, gs, w["down"], fast)
             hq, hs, z = residual_adaln_fp8(
-                y, z, mod[l, 2, 2], mod[l + 1, 0, 0], mod[l + 1, 0, 1]
+                y, z, mod[l, 2, 2], mod[l + 1, 0, 0], mod[l + 1, 0, 1], x_scales=sc
             )
+        else:
+            y = fp8_linear(gq, gs, w["down"], fast)
     shift, scale = fin.chunk(2, dim=-1)
     hid, _ = residual_adaln(y, z, mod[-1, 2, 2], shift, scale + 1)
     return model.unpatchify(model.out_proj(hid), H, W)

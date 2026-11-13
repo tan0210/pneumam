@@ -48,10 +48,17 @@ def test_samples_do_not_depend_on_the_rest_of_the_batch(inputs):
     assert rel(one, both[:1]) < 1e-5
 
 
+@torch.no_grad()
 def test_context_trimming_does_not_change_the_result(inputs):
     m = tiny_model()
-    want = run(m, Runtime(trim_context=False), inputs)
-    assert rel(run(m, Runtime(trim_context=True), inputs), want) < 1e-5
+    x, t, _ = inputs
+    text = padded_text(B, 40, 32, (5, 11))
+    want = run(m, Runtime(trim_context=False), (x, t, text))
+    rt = Runtime()
+    assert rt.trim_context
+    ctx = m.encode_context(rt, text)
+    assert ctx.kv[0][0].shape[1] == 16 and ctx.seqused.tolist() == [5, 11]
+    assert rel(run(m, rt, (x, t, text)), want) < 1e-5
 
 
 def test_fp8_tracks_bf16(inputs):

@@ -14,8 +14,8 @@ class Runtime:
     carrying caches along. Whoever runs the model owns one.
 
     Attributes:
-        trim_context: Drop trailing zero padding from the text context where that is faster.
-            Ignored while autograd is enabled.
+        trim_context: Drop trailing zero padding from the text context, which is faster and
+            does not change the result. Ignored while autograd is enabled.
         checkpointing: Recompute each block during backward instead of storing its activations.
             Only matters while autograd is enabled.
         fp8: Quantized projection weights per block, by layer name, or None while FP8 is off.
@@ -26,7 +26,7 @@ class Runtime:
         graphs: Captured CUDA graphs, keyed by whatever captured them.
     """
 
-    trim_context: bool = False
+    trim_context: bool = True
     checkpointing: bool = True
     fp8: list[dict[str, FP8Weight]] | None = None
     fp8_fast_accum: bool = False

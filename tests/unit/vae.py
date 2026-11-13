@@ -3,7 +3,7 @@ import torch
 from helpers import rel, tiny_wan_vae
 from safetensors.torch import save_file
 
-from pneumam.components.vae import (
+from pneumam.models.vae import (
     Wan21Decoder,
     Wan21Encoder,
     latents,

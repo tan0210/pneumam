@@ -2,7 +2,7 @@ import pytest
 import torch
 from helpers import padded_text, rel, tiny_config, tiny_model, tiny_wan_vae
 
-from pneumam.components.vae import Wan21Decoder
+from pneumam.models.vae import Wan21Decoder
 from pneumam.pipeline import Pipeline, to_uint8
 from pneumam.runtime import Runtime
 from pneumam.sampling.loop import sample

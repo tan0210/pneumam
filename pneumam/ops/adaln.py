@@ -87,6 +87,7 @@ def residual_adaln_fp8(
     shift: torch.Tensor,
     scale: torch.Tensor,
     eps: float = 1e-6,
+    x_scales: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``residual_adaln`` whose modulated output is returned as FP8 with a scale per token.
 
@@ -99,6 +100,7 @@ def residual_adaln_fp8(
         shift: Shift, shape ``[B, D]``.
         scale: Scale (already including the +1), shape ``[B, D]``.
         eps: LayerNorm epsilon.
+        x_scales: Scales from ``fp8_linear_unscaled`` that ``x`` still has to be multiplied by.
 
     Returns:
         ``(q, s, z)``: the FP8 output ``[B, S, D]``, its float32 token scales ``[B * S, 1]``, and
@@ -111,5 +113,5 @@ def residual_adaln_fp8(
     if x.shape != residual.shape or x.dtype != residual.dtype:
         raise ValueError("x and residual must match")
     if triton.available and _dispatch.arch(x.device) != "reference":
-        return triton.residual_adaln_fp8(x, residual, gate, shift, scale, eps)
-    return reference.residual_adaln_fp8(x, residual, gate, shift, scale, eps)
+        return triton.residual_adaln_fp8(x, residual, gate, shift, scale, eps, x_scales)
+    return reference.residual_adaln_fp8(x, residual, gate, shift, scale, eps, x_scales)

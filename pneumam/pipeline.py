@@ -5,7 +5,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from .components.vae.latents import from_bchw
+from .models.vae.latents import from_bchw
 from .runtime import Runtime
 from .sampling.loop import sample
 from .sampling.schedules import noise
