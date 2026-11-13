@@ -321,7 +321,7 @@ def addmm_(
     Raises:
         RuntimeError: If ``x`` is not on a CUDA device.
     """
-    if _dispatch.arch(x.device) == "sm120" and warpy.fits_accum(x, weight, transposed):
+    if _dispatch.arch(x.device) == "sm120" and warpy.fits_accum(x, weight, transposed, out=out):
         return warpy.addmm_(out, x, weight, transposed)
     return out.addmm_(x, weight if transposed else weight.T)
 
@@ -343,7 +343,7 @@ def gelu_addmm_(
     Raises:
         RuntimeError: If ``x`` is not on a CUDA device.
     """
-    if _dispatch.arch(x.device) == "sm120" and warpy.fits_accum(x, weight):
+    if _dispatch.arch(x.device) == "sm120" and warpy.fits_accum(x, weight, out=out):
         return warpy.gelu_addmm_(out, x, weight)
     pre = out.addmm_(x, weight.T)
     return F.gelu(pre), pre
@@ -368,6 +368,6 @@ def dgelu_addmm_(
     Raises:
         RuntimeError: If ``g`` is not on a CUDA device.
     """
-    if _dispatch.arch(g.device) == "sm120" and warpy.fits_accum(g, weight, True):
+    if _dispatch.arch(g.device) == "sm120" and warpy.fits_accum(g, weight, True, out=out, pre=pre):
         return warpy.dgelu_addmm_(out, g, weight, pre)
     return out.addmm_(g, weight).mul_(_gelu_slope(pre).to(out.dtype))

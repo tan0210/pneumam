@@ -275,18 +275,27 @@ def mlp_grad(x: torch.Tensor, w_up: torch.Tensor, w_down: torch.Tensor) -> torch
     return y.view(*x.shape[:-1], w_down.shape[0])
 
 
-def fits_accum(x: torch.Tensor, weight: torch.Tensor, transposed: bool = False) -> bool:
+def fits_accum(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    transposed: bool = False,
+    out: torch.Tensor | None = None,
+    pre: torch.Tensor | None = None,
+) -> bool:
     """Tell whether the accumulating products can run these operands.
 
     Args:
         x: Activations, shape ``[M, K]``, or ``[M, N]`` if ``transposed``.
         weight: Weight, shape ``[N, K]``.
         transposed: Whether the product is ``x @ weight`` instead of ``x @ weight.T``.
+        out: The buffer the product is added to, if known.
+        pre: The GELU input of ``dgelu_addmm_``, if known.
 
     Returns:
         True if the installed library can accumulate, the operands are contiguous bf16 or fp16
         of one dtype, ``M`` is a multiple of 128, and the product's output and inner widths are
-        multiples of 128 and 64.
+        multiples of 128 and 64. ``out`` and ``pre``, when given, must also be contiguous with
+        the dtype of ``x``.
     """
     n, k = weight.shape[::-1] if transposed else weight.shape
     return (
@@ -297,6 +306,9 @@ def fits_accum(x: torch.Tensor, weight: torch.Tensor, transposed: bool = False) 
         and x.shape[0] % _BM == 0
         and n % 128 == 0
         and k % 64 == 0
+        and all(
+            t is None or (t.dtype == x.dtype and t.is_contiguous()) for t in (out, pre)
+        )
     )
 
 
