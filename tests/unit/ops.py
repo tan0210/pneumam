@@ -205,3 +205,26 @@ def test_warpy_runs_whole_blocks_in_place_and_pads_only_the_tail(rows, monkeypat
             [(128, False)] if tail else []
         )
         assert launches == expect
+
+
+@pytest.mark.parametrize("parts", [1, 2, 3])
+@pytest.mark.parametrize("fp8", ["off", "forward", "both"])
+def test_lora_linear_matches_the_dense_formula_and_its_gradients(parts, fp8):
+    n, i, o, r, scale = 10, 64, 128, 4, 0.5
+    x = torch.randn(n, i, requires_grad=True)
+    w = torch.randn(parts * o, i)
+    A = torch.randn(parts * r, i, requires_grad=True)
+    Bm = torch.randn(parts, o, r, requires_grad=True)
+    w8 = gemm.quantize_weight(w) if fp8 != "off" else None
+    w8_t = gemm.quantize_weight(w.T.contiguous()) if fp8 == "both" else None
+    args = (x, w, A, Bm, A.detach(), (Bm * scale).detach(), scale, w8, w8_t)
+    out = lora.lora_linear(*args)
+    dense = x @ w.T + scale * x @ (torch.block_diag(*Bm.unbind(0)) @ A).T
+    cot = torch.randn_like(out)
+    got = torch.autograd.grad((out * cot).sum(), (x, A, Bm))
+    want = torch.autograd.grad((dense * cot).sum(), (x, A, Bm))
+    tol = 1e-4 if fp8 == "off" else 0.05
+    assert rel(out, dense) < tol
+    assert rel(got[0], want[0]) < (1e-4 if fp8 != "both" else 0.05)
+    assert rel(got[1], want[1]) < 1e-4 and rel(got[2], want[2]) < 1e-4
+    assert w.grad is None

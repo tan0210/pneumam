@@ -28,6 +28,13 @@ def _adapted(model: AnimaDiT) -> bool:
     )
 
 
+def _attention_scales(model: AnimaDiT) -> list[dict[str, float]]:
+    return [
+        {n: norm_scale(getattr(b, f"{n}_norm")) for n in ("q", "k", "xq", "xk")}
+        for b in model.blocks
+    ]
+
+
 def _mlp(b: nn.Module, hid: torch.Tensor) -> torch.Tensor:
     up, down = b.up, b.down
     if type(up) is nn.Linear and type(down) is nn.Linear:
@@ -46,19 +53,28 @@ def _block(
     cos: torch.Tensor,
     sin: torch.Tensor,
     ctx: Context,
+    scales: dict[str, float] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     c, b = model.cfg, model.blocks[l]
     q, k, v = qkv_norm_rope(b.qkv(hid), b.q_norm, b.k_norm, cos, sin, c.heads, c.qk_eps)  # type: ignore
+    if scales is None:
+        att = A.attention(q, k, v)
+    else:
+        att = A.attention_fp8_grad(q, k, v, scales["q"], scales["k"])
     hid, z = residual_adaln(
-        b.o1(A.attention(q, k, v)),  # type: ignore
+        b.o1(att),  # type: ignore
         z,
         mod[l, 0, 2],
         mod[l, 1, 0],
         mod[l, 1, 1],
     )
     q = head_norm(b.xq(hid), b.xq_norm, c.heads, c.qk_eps)  # type: ignore
+    if scales is None:
+        att = ctx.attend(l, q)
+    else:
+        att = A.attention_fp8_grad(q, *ctx.kv[l], scales["xq"], scales["xk"])
     hid, z = residual_adaln(
-        b.o2(ctx.attend(l, q)),  # type: ignore
+        b.o2(att),  # type: ignore
         z,
         mod[l, 1, 2],
         mod[l, 2, 0],
@@ -103,8 +119,23 @@ def forward_fused(
     hid = adaln(z, mod[0, 0, 0], mod[0, 0, 1])
     remat = rt.checkpointing and torch.is_grad_enabled()
     capturing = x.is_cuda and torch.cuda.is_current_stream_capturing()
+    scales = None
+    if rt.fp8_attention_grad and torch.is_grad_enabled():
+        if rt.fp8_scales is None:
+            rt.fp8_scales = _attention_scales(model)
+        scales = rt.fp8_scales
     for l in range(model.cfg.layers):
-        args = (model, l, hid, z, mod, cos, sin, ctx)
+        args = (
+            model,
+            l,
+            hid,
+            z,
+            mod,
+            cos,
+            sin,
+            ctx,
+            None if scales is None else scales[l],
+        )
         if remat:
             hid, z = checkpoint(  # type: ignore
                 _block,
@@ -140,10 +171,7 @@ def enable_fp8(model: AnimaDiT, rt: Runtime, fast_accum: bool = False) -> None:
         {n: quantize_weight(getattr(b, n).weight) for n in FP8_LAYERS}
         for b in model.blocks
     ]
-    rt.fp8_scales = [
-        {n: norm_scale(getattr(b, f"{n}_norm")) for n in ("q", "k", "xq")}
-        for b in model.blocks
-    ]
+    rt.fp8_scales = _attention_scales(model)
     rt.fp8_fast_accum = fast_accum
     rt.graphs.clear()
 

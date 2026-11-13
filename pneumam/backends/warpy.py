@@ -354,6 +354,101 @@ def _(q, k, v, seqused_k, rescale):
     )
 
 
+@torch.library.custom_op("pneumam::attention_grad_warpy", mutates_args=())
+def _attention_grad(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_scale: float, k_scale: float
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    q, k, v = q.detach(), k.detach(), v.detach()
+    q8, k8, v8 = (t.to(FP8) for t in (q * q_scale, k * k_scale, v))
+    scale = 1.0 / (math.sqrt(q.shape[-1]) * q_scale * k_scale)
+    out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+    heads_first = (q8.transpose(1, 2), k8.transpose(1, 2), v8.transpose(1, 2))
+    _, lse, pmax = _wk.attn_fwd(  # type: ignore
+        *heads_first, softmax_scale=scale, out=out.transpose(1, 2), return_lse=True
+    )
+    return out, q8, k8, v8, lse.float().contiguous(), pmax.float().contiguous()
+
+
+@_attention_grad.register_fake
+def _(q, k, v, q_scale, k_scale):
+    stats = (q.shape[0], q.shape[2], q.shape[1])
+    return (
+        q.new_empty(q.shape, dtype=torch.bfloat16),
+        q.new_empty(q.shape, dtype=FP8),
+        k.new_empty(k.shape, dtype=FP8),
+        v.new_empty(v.shape, dtype=FP8),
+        q.new_empty(stats, dtype=torch.float32),
+        q.new_empty(stats, dtype=torch.float32),
+    )
+
+
+@torch.library.custom_op("pneumam::attention_grad_bwd_warpy", mutates_args=())
+def _attention_grad_bwd(
+    q8: torch.Tensor,
+    k8: torch.Tensor,
+    v8: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    pmax: torch.Tensor,
+    g: torch.Tensor,
+    q_scale: float,
+    k_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    scale = 1.0 / (math.sqrt(q8.shape[-1]) * q_scale * k_scale)
+    # tensors saved by autograd still carry a graph, which the kernel cannot take
+    operands = [t.detach().transpose(1, 2).contiguous() for t in (q8, k8, v8, out)]
+    dout = g.detach().transpose(1, 2).to(torch.bfloat16).contiguous()
+    stats = (lse.detach(), pmax.detach())
+    dq, dk, dv = _wk.attn_bwd(*operands, *stats, dout, softmax_scale=scale)  # type: ignore
+    # the kernel differentiates in the scaled units the FP8 operands hold
+    dq, dk = dq * q_scale, dk * k_scale
+    return tuple(t.transpose(1, 2).contiguous() for t in (dq, dk, dv))  # type: ignore
+
+
+@_attention_grad_bwd.register_fake
+def _(q8, k8, v8, out, lse, pmax, g, q_scale, k_scale):
+    return tuple(t.new_empty(t.shape, dtype=torch.bfloat16) for t in (q8, k8, v8))
+
+
+def _attention_grad_setup(ctx, inputs, output):
+    ctx.save_for_backward(*output)
+    ctx.scales, ctx.dtype = (inputs[3], inputs[4]), inputs[0].dtype
+
+
+def _attention_grad_backward(ctx, g, *unused):
+    out, q8, k8, v8, lse, pmax = ctx.saved_tensors
+    grads = _attention_grad_bwd(q8, k8, v8, out, lse, pmax, g, *ctx.scales)
+    return (*(t.to(ctx.dtype) for t in grads), None, None)
+
+
+_attention_grad.register_autograd(
+    _attention_grad_backward, setup_context=_attention_grad_setup
+)
+
+
+def attention_grad(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_scale: float, k_scale: float
+) -> torch.Tensor:
+    """Full, non-causal multi-head attention with FP8 forward and backward passes.
+
+    Differentiable. Gradients treat quantization as the identity.
+
+    Args:
+        q: Queries accepted by ``fits_attention``, shape ``[B, Sq, H, hd]``. After scaling they
+            must stay within 448 in magnitude.
+        k: Keys, shape ``[B, Sk, H, hd]``, with the same bound after scaling.
+        v: Values, shape ``[B, Sk, H, hd]``. They are quantized unscaled.
+        q_scale: Factor the queries are multiplied by before quantizing.
+        k_scale: Factor the keys are multiplied by before quantizing.
+
+    Returns:
+        Attention output in true units, dtype of ``q``, shape ``[B, Sq, H, hd]``.
+    """
+    return _attention_grad(q, k, v, q_scale, k_scale)[0].to(q.dtype)
+
+
 def attention(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rescale: bool = True
 ) -> torch.Tensor:

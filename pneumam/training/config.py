@@ -22,6 +22,12 @@ class TrainConfig:
         context_length: Text embeddings are zero-padded to this many tokens. Use the value
             images will be generated with.
         seed: Seed of the noise, the noise levels and the data order.
+        fp8_base: Compute the frozen base products of adapted layers in FP8. Faster on GPUs
+            with an FP8 matrix multiplication.
+        fp8_backward: With ``fp8_base``, also run their backward pass in FP8. Faster still, with
+            noisier gradients.
+        fp8_attention: Run self- and cross-attention in FP8 in both directions where the GPU
+            has kernels. Faster, and the gradients stay within about 1% of bf16.
         graph: Replay the forward and backward passes as a CUDA graph, which is faster at small
             batch sizes. Each latent size captures its own graph on first use and keeps its
             memory.
@@ -41,6 +47,9 @@ class TrainConfig:
     caption_dropout: float = 0.1
     context_length: int = 512
     seed: int = 1234
+    fp8_base: bool = False
+    fp8_backward: bool = False
+    fp8_attention: bool = True
     graph: bool = False
 
     def dumps(self) -> str:

@@ -8,7 +8,8 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import nn
 
-from ..ops.lora import lora_add
+from ..ops.gemm import FP8Weight, fp8_supported, frozen_linear_fp8, quantize_weight
+from ..ops.lora import lora_add, lora_linear
 
 LORA_FORMAT = "pneumam-lora-1"
 _LEGACY = re.compile(
@@ -57,6 +58,7 @@ class LoRALinear(nn.Module):
         self.lora_A = nn.Parameter(torch.empty(parts * rank, base.in_features, **kw))
         self.lora_B = nn.Parameter(torch.zeros(parts, out, rank, **kw))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        self.fp8: tuple[FP8Weight, FP8Weight | None] | None = None
 
     @property
     def weight(self) -> torch.Tensor:
@@ -83,8 +85,21 @@ class LoRALinear(nn.Module):
                 flat.dtype
             )  # cast every call: optimizers may update in place
             bs = (self.lora_B * self.scale).to(flat.dtype)
-        base, low = self.base(flat), self.drop(flat)
-        out = lora_add(base, low, self.lora_A, self.lora_B, a, bs, self.scale)
+        w = self.base.weight
+        if isinstance(self.drop, nn.Identity):
+            fp8 = self.fp8 or (None, None)
+            out = lora_linear(
+                flat, w, self.lora_A, self.lora_B, a, bs, self.scale, *fp8
+            )
+        else:
+            if self.fp8 is None:
+                base = flat @ w.T
+            else:
+                base = frozen_linear_fp8(flat, w, *self.fp8)
+            low = self.drop(flat)
+            out = lora_add(base, low, self.lora_A, self.lora_B, a, bs, self.scale)
+        if self.base.bias is not None:
+            out = out + self.base.bias
         return out.view(*lead, out.shape[-1])
 
     def delta_weight(self) -> torch.Tensor:
@@ -118,6 +133,40 @@ def has_lora(model: nn.Module) -> bool:
         True if at least one ``LoRALinear`` is present.
     """
     return any(isinstance(m, LoRALinear) for m in model.modules())
+
+
+def enable_fp8_base(model: nn.Module, backward: bool = False) -> None:
+    """Make every adapted layer compute its frozen base product in FP8.
+
+    This speeds up training on GPUs with an FP8 matrix multiplication. It quantizes the current
+    base weights, so call it with the model on its final device, and again after changing them.
+
+    Args:
+        model: A model with adapters attached.
+        backward: Also run the backward pass through the base weights in FP8. This is faster
+            still and adds quantization noise to the gradients.
+
+    Raises:
+        RuntimeError: If the GPU has no FP8 matrix multiplication.
+    """
+    for m in model.modules():
+        if isinstance(m, LoRALinear):
+            w = m.base.weight
+            if not fp8_supported(w.device):
+                raise RuntimeError("this GPU has no FP8 matrix multiplication")
+            w8_t = quantize_weight(w.detach().T.contiguous()) if backward else None
+            m.fp8 = (quantize_weight(w.detach()), w8_t)
+
+
+def disable_fp8_base(model: nn.Module) -> None:
+    """Go back to computing base products in the model's own precision.
+
+    Args:
+        model: The model.
+    """
+    for m in model.modules():
+        if isinstance(m, LoRALinear):
+            m.fp8 = None
 
 
 def lora_parameters(model: nn.Module) -> list[nn.Parameter]:

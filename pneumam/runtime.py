@@ -21,7 +21,9 @@ class Runtime:
         fp8: Quantized projection weights per block, by layer name, or None while FP8 is off.
         fp8_fast_accum: Accumulate FP8 products with reduced precision where the GPU offers it.
         fp8_scales: Per block, the fixed FP8 scales of the attention operands, by operand name.
-            Only used by the experimental FP8 attention path.
+            Used by the experimental FP8 attention path and by ``fp8_attention_grad``.
+        fp8_attention_grad: Run self- and cross-attention in FP8 in both directions while autograd is
+            enabled, where the GPU has kernels for it. Faster training, noisier gradients.
         tables: Cached rotary tables, keyed by token grid and device.
         graphs: Captured CUDA graphs, keyed by whatever captured them.
     """
@@ -31,5 +33,6 @@ class Runtime:
     fp8: list[dict[str, FP8Weight]] | None = None
     fp8_fast_accum: bool = False
     fp8_scales: list[dict[str, float]] | None = None
+    fp8_attention_grad: bool = False
     tables: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
     graphs: dict[tuple, Any] = field(default_factory=dict)

@@ -528,10 +528,19 @@ def ops(
     return rows
 
 
+TRAIN_VARIANTS = (
+    ("bf16", False, False, False),
+    ("fp8 attention", False, False, True),
+    ("fp8 attention + fp8 base", True, True, True),
+)
+
+
 def train(
     args: argparse.Namespace, model: AnimaDiT, width: int, height: int, batch: int
 ) -> dict[str, Any]:
-    """Time a LoRA training step: forward, backward and optimizer, eager and as a CUDA graph.
+    """Time a LoRA training step in every precision variant, eager and as a CUDA graph.
+
+    Each variant's gradient is compared with the bf16 eager gradient.
 
     Args:
         args: Parsed options with ``lora_rank``.
@@ -541,7 +550,7 @@ def train(
         batch: Samples per step.
 
     Returns:
-        The timing rows and one profiler table per checkpointing setting.
+        The timing rows and a profiler table per traced variant.
     """
     from torch.profiler import ProfilerActivity, profile
 
@@ -551,14 +560,17 @@ def train(
     eps = noise(batch, height // 8, width // 8, model.cfg.in_ch, 1, device)
     sigma = torch.linspace(0.2, 0.9, batch, device=device)
     s = sigma.view(batch, 1, 1, 1)
-    xt, target = ((1 - s) * x0 + s * eps).to(dt), eps - x0
-    text = make_text(args, model, batch)
+    inputs = (
+        ((1 - s) * x0 + s * eps).to(dt),
+        sigma,
+        make_text(args, model, batch),
+        eps - x0,
+    )
     rows: list[dict[str, Any]] = []
     tables: dict[str, str] = {}
+    heading(f"train {size}")
 
-    def add(
-        label: str, fn: Callable[[], Any], base: float | None = None
-    ) -> float | None:
+    def add(label: str, fn: Callable[[], Any], note: str = "") -> float | None:
         def run():
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats(device)
@@ -569,93 +581,88 @@ def train(
         r = attempt(f"train {size} {label}", run)
         if r is None:
             return None
-        ratio = f"{r['ms'] / base:5.2f}x inference" if base else ""
-        rows.append({"size": size, "what": label, **r})
-        print(f"  {label:44s} {r['ms']:8.2f} ms  peak {r['peak_gb']:5.1f} GB  {ratio}")
+        rows.append({"size": size, "what": label, "note": note, **r})
+        print(f"  {label:58s} {r['ms']:8.2f} ms  peak {r['peak_gb']:5.1f} GB  {note}")
         return r["ms"]
 
     def infer():
         with torch.no_grad():
             rt = Runtime()
-            return fused.forward(model, rt, xt, sigma, model.encode_context(rt, text))
+            xt, sg, text, _ = inputs
+            return fused.forward(model, rt, xt, sg, model.encode_context(rt, text))
 
-    base = add("inference forward, no adapter", infer)
+    add("inference forward, no adapter", infer)
     params = L.add_lora(model, rank=args.lora_rank)
+    flat = lambda grads: torch.cat(
+        [g.flatten().float() for g in grads if g is not None]
+    )
+    cosine = torch.nn.functional.cosine_similarity
     try:
         with torch.no_grad():
             for p in params[1::2]:
                 p.normal_(std=0.02)  # a zero B would hide the adapter's gradient path
-        add("inference forward, adapter attached", infer, base)
-        inputs = (xt, sigma, text, target)
-        for ckpt in (False, True):
-            rt = Runtime(checkpointing=ckpt)
-            tag = f"checkpointing {'on' if ckpt else 'off'}"
+        add("inference forward, adapter attached", infer)
+        reference = None
+        for name, base, backward, attn in TRAIN_VARIANTS:
+            if base:
+                L.enable_fp8_base(model, backward)
+            else:
+                L.disable_fp8_base(model)
+            for ckpt in (False, True):
+                rt = Runtime(checkpointing=ckpt, fp8_attention_grad=attn)
+                tag = f"{name}, checkpointing {'on' if ckpt else 'off'}"
 
-            def loss_fn(xt, sigma, text, target, rt=rt):
-                return torch.nn.functional.mse_loss(
-                    model.velocity(rt, xt, sigma, text).float(), target
+                def loss_fn(xt, sg, text, target, rt=rt):
+                    v = model.velocity(rt, xt, sg, text)
+                    return torch.nn.functional.mse_loss(v.float(), target)
+
+                def forward_backward(loss_fn=loss_fn):
+                    for p in params:
+                        p.grad = None  # a graphed step leaves its gradients attached
+                    loss_fn(*inputs).backward()
+                    grads = [p.grad for p in params]
+                    for p in params:
+                        p.grad = None
+                    return grads
+
+                def measure(
+                    tag=tag, loss_fn=loss_fn, forward_backward=forward_backward
+                ):
+                    nonlocal reference
+                    eager = flat(forward_backward())
+                    if reference is None:
+                        reference = eager
+                    note = f"gradient cosine vs bf16 {cosine(eager, reference, dim=0).item():.4f}"
+                    add(f"{tag}: eager", forward_backward, note)
+                    runner = GraphedStep(loss_fn, params)
+                    runner(*inputs)
+                    got = flat([p.grad for p in params])
+                    note = f"graph vs eager gradient rel err {rel(got, eager):.1e}"
+                    add(f"{tag}: CUDA graph", lambda: runner(*inputs), note)
+
+                attempt(f"train {size} {tag}", measure)
+                traced = (
+                    name in (TRAIN_VARIANTS[0][0], TRAIN_VARIANTS[-1][0]) and not ckpt
                 )
+                if traced and "trace" not in args.skip:
 
-            def forward_only(loss_fn=loss_fn):
-                return loss_fn(*inputs)
+                    def table(forward_backward=forward_backward):
+                        for _ in range(2):
+                            forward_backward()
+                        kinds = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+                        with profile(activities=kinds) as prof:
+                            for _ in range(3):
+                                forward_backward()
+                            torch.cuda.synchronize()
+                        return prof.key_averages().table(
+                            sort_by="self_cuda_time_total", row_limit=args.top
+                        )
 
-            def forward_backward(loss_fn=loss_fn):
-                loss_fn(*inputs).backward()
-                grads = [p.grad for p in params]
-                for p in params:
-                    p.grad = None
-                return grads
-
-            add(f"{tag}: forward with autograd", forward_only, base)
-            add(f"{tag}: forward + backward", forward_backward, base)
-            opt = torch.optim.AdamW(params, lr=0.0, weight_decay=0.0, fused=True)
-
-            def full_step(loss_fn=loss_fn, opt=opt):
-                loss_fn(*inputs).backward()
-                torch.nn.utils.clip_grad_norm_(params, 1.0)
-                opt.step()
-                opt.zero_grad(set_to_none=True)
-
-            add(f"{tag}: full step with AdamW", full_step, base)
-
-            def graphed(loss_fn=loss_fn, tag=tag):
-                grads = [g for g in forward_backward() if g is not None]
-                want = torch.cat([g.flatten().float() for g in grads])
-                runner = GraphedStep(loss_fn, params)
-                runner(*inputs)
-                got = torch.cat([p.grad.flatten().float() for p in params])  # type: ignore
-                print(f"  {tag}: graph vs eager gradient rel err {rel(got, want):.2e}")
-                add(
-                    f"{tag}: forward + backward, CUDA graph",
-                    lambda: runner(*inputs),
-                    base,
-                )
-                opt = torch.optim.AdamW(
-                    params, lr=0.0, weight_decay=0.0, fused=True, capturable=True
-                )
-                stepper = GraphedStep(loss_fn, params, opt, 1.0)
-                add(f"{tag}: full step, CUDA graph", lambda: stepper(*inputs), base)
-
-            attempt(f"train {size} {tag} graph", graphed)
-
-            def traced(forward_backward=forward_backward):
-                for _ in range(2):
-                    forward_backward()
-                kinds = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
-                with profile(activities=kinds) as prof:
-                    for _ in range(3):
-                        forward_backward()
-                    torch.cuda.synchronize()
-                return prof.key_averages().table(
-                    sort_by="self_cuda_time_total", row_limit=args.top
-                )
-
-            if "trace" not in args.skip:
-                table = attempt(f"train {size} {tag} trace", traced)
-                if table is not None:
-                    tables[tag] = table
-                    heading(f"{size}, {tag}, three forward + backward passes")
-                    print(table)
+                    out = attempt(f"train {size} {tag} trace", table)
+                    if out is not None:
+                        tables[tag] = out
+                        heading(f"{size}, {tag}, three forward + backward passes")
+                        print(out)
     finally:
         L.remove_lora(model, merge=False)
         for p in model.parameters():

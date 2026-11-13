@@ -7,6 +7,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from ..adapters.lora import enable_fp8_base
 from ..graphs import GraphedStep
 from ..runtime import Runtime
 from . import distributed
@@ -95,6 +96,9 @@ class Trainer:
         else:
             self._draw = lambda latents, context: (latents, context)
             self._loss = loss_fn
+        if cfg.fp8_base:
+            enable_fp8_base(model, cfg.fp8_backward)
+        rt.fp8_attention_grad = cfg.fp8_attention
         self._graphed = None
         if cfg.graph:
             self._graphed = GraphedStep(self._loss, params)

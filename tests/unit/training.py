@@ -264,3 +264,67 @@ def test_adapter_follows_in_place_updates_that_skip_version_counters():
         want = layer.base(x) + x @ layer.delta_weight().T
     assert not torch.allclose(layer(x), before)
     assert torch.allclose(layer(x), want, atol=1e-5)
+
+
+def test_frozen_fp8_product_and_its_gradients():
+    from pneumam.ops import gemm
+
+    x = torch.randn(2, 6, 64, requires_grad=True)
+    w = torch.randn(128, 64)
+    w8, w8_t = gemm.quantize_weight(w), gemm.quantize_weight(w.T.contiguous())
+    cot = torch.randn(2, 6, 128)
+    want = torch.autograd.grad(((x @ w.T) * cot).sum(), x)[0]
+    y = gemm.frozen_linear_fp8(x, w, w8)
+    assert y.shape == (2, 6, 128) and y.dtype == x.dtype
+    assert ((y - x @ w.T).norm() / (x @ w.T).norm()) < 0.05
+    exact = torch.autograd.grad((y * cot).sum(), x)[0]
+    assert torch.allclose(exact, want, rtol=1e-4, atol=1e-5)  # straight-through
+    y = gemm.frozen_linear_fp8(x, w, w8, w8_t)
+    noisy = torch.autograd.grad((y * cot).sum(), x)[0]
+    assert ((noisy - want).norm() / want.norm()) < 0.05
+    assert not torch.equal(noisy, want)
+
+
+def test_fp8_base_keeps_adapters_trainable():
+    m, rt = tiny_model(), Runtime()
+    params = L.add_lora(m, rank=2)
+    with torch.no_grad():
+        for p in params[1::2]:
+            p.normal_(std=0.05)
+    latents, text = torch.randn(B, H, W, 4), padded_text(B, S, 32, (5, 9))
+    seeded = lambda: torch.Generator().manual_seed(2)
+    loss = flow_loss(m, rt, latents, text, caption_dropout=0.0, generator=seeded())
+    want = torch.autograd.grad(loss, params)
+    for backward in (False, True):
+        L.enable_fp8_base(m, backward)
+        assert (m.blocks[0].qkv.fp8[1] is not None) == backward
+        fp8 = flow_loss(m, rt, latents, text, caption_dropout=0.0, generator=seeded())
+        got = torch.autograd.grad(fp8, params)
+        assert abs(fp8.item() - loss.item()) / loss.item() < 0.1
+        a = torch.cat([g.flatten() for g in got])
+        b = torch.cat([g.flatten() for g in want])
+        assert torch.nn.functional.cosine_similarity(a, b, dim=0) > 0.9
+    L.disable_fp8_base(m)
+    assert m.blocks[0].qkv.fp8 is None
+    again = flow_loss(m, rt, latents, text, caption_dropout=0.0, generator=seeded())
+    assert torch.equal(again, loss)
+
+
+def test_trainer_switches_on_the_fp8_options():
+    cfg = TrainConfig(
+        steps=3, lr=1e-3, warmup=1, fp8_base=True, fp8_backward=True, fp8_attention=True
+    )
+    m, trainer = make(cfg)
+    assert m.blocks[0].qkv.fp8 is not None and trainer.rt.fp8_attention_grad
+    trainer.fit(data())
+    assert trainer.step == 3 and trainer.rt.fp8_scales is not None
+    assert all(torch.isfinite(p).all() for p in trainer.params)
+
+
+def test_fp8_attention_grad_falls_back_without_a_kernel():
+    from pneumam.ops import attention as A
+
+    q, k, v = (torch.randn(2, 12, 4, 16, requires_grad=True) for _ in range(3))
+    out = A.attention_fp8_grad(q, k, v, 4.0, 4.0)
+    assert torch.equal(out, A.attention(q, k, v))
+    assert all(g is not None for g in torch.autograd.grad(out.sum(), (q, k, v)))

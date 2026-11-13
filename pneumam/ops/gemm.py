@@ -10,6 +10,7 @@ __all__ = [
     "fp8_linear",
     "fp8_linear_unscaled",
     "fp8_supported",
+    "frozen_linear_fp8",
     "linear",
     "linear_gelu",
     "mlp",
@@ -186,3 +187,71 @@ def rowquant(
     if triton.available and _dispatch.arch(x.device) != "reference":
         return triton.rowquant(x, gelu, scales)
     return reference.rowquant(x, gelu, scales)
+
+
+@torch.library.custom_op("pneumam::frozen_linear_fp8", mutates_args=())
+def _frozen_fp8(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    wq: torch.Tensor,
+    ws: torch.Tensor,
+    tq: torch.Tensor | None,
+    ts: torch.Tensor | None,
+) -> torch.Tensor:
+    q, s = rowquant(x[None])
+    return fp8_linear(q, s, FP8Weight(wq, ws))[0].to(x.dtype)
+
+
+@_frozen_fp8.register_fake
+def _(x, weight, wq, ws, tq, ts):
+    return x.new_empty(x.shape[0], weight.shape[0])
+
+
+def _frozen_fp8_setup(ctx, inputs, output):
+    _, weight, _, _, tq, ts = inputs
+    ctx.fp8 = tq is not None and ts is not None
+    ctx.save_for_backward(*((tq, ts) if ctx.fp8 else (weight,)))
+
+
+def _frozen_fp8_backward(ctx, g):
+    if not ctx.fp8:
+        (weight,) = ctx.saved_tensors
+        return g @ weight, None, None, None, None, None
+    tq, ts = ctx.saved_tensors
+    gq, gs = rowquant(g[None])
+    dx = fp8_linear(gq, gs, FP8Weight(tq, ts))[0]
+    return dx.to(g.dtype), None, None, None, None, None
+
+
+_frozen_fp8.register_autograd(_frozen_fp8_backward, setup_context=_frozen_fp8_setup)
+
+
+def frozen_linear_fp8(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    w8: FP8Weight,
+    w8_t: FP8Weight | None = None,
+) -> torch.Tensor:
+    """Compute ``x @ weight.T`` in FP8 for a weight that is not trained.
+
+    Differentiable in ``x`` only. The gradient is that of the exact product, so quantization is
+    treated as the identity.
+
+    Args:
+        x: Activations, shape ``[..., K]``.
+        weight: The weight, shape ``[N, K]``. Used for the backward pass unless ``w8_t`` is
+            given.
+        w8: ``quantize_weight(weight)``.
+        w8_t: ``quantize_weight(weight.T)``. If given, the backward pass also runs in FP8,
+            which is faster and adds quantization noise to the gradient.
+
+    Returns:
+        Tensor with the dtype of ``x``, shape ``[..., N]``.
+
+    Raises:
+        RuntimeError: If ``x`` is not on a CUDA device.
+    """
+    flat = x.reshape(-1, x.shape[-1])
+    tq, ts = (None, None) if w8_t is None else w8_t
+    y = _frozen_fp8(flat, weight, w8.q, w8.s, tq, ts)
+    return y.view(*x.shape[:-1], weight.shape[0])

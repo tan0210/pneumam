@@ -178,3 +178,18 @@ def test_errors(adapted, saved, tmp_path):
     for case in cases:
         with pytest.raises(ValueError):
             case()
+
+
+def test_dropout_takes_the_separate_path_and_stays_trainable():
+    m = tiny_model()
+    params = L.add_lora(m, rank=2, dropout=0.5)
+    with torch.no_grad():
+        for p in params[1::2]:
+            p.normal_(std=0.05)
+    m.eval()
+    kept = run(m)
+    m.train()
+    dropped = run(m)
+    assert not torch.equal(dropped, kept)  # half of the adapter's input is zeroed
+    dropped.square().sum().backward()
+    assert all(p.grad is not None for p in params)

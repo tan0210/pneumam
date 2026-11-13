@@ -8,6 +8,7 @@ from . import _dispatch
 __all__ = [
     "attention",
     "attention_fp8",
+    "attention_fp8_grad",
     "attention_quantized",
     "cross_attention_trimmed",
     "cross_attention_trimmed_quantized",
@@ -80,6 +81,33 @@ def attention_fp8(
     """
     if _warpy(q):
         return warpy.attention(q, k, v, rescale).flatten(2)
+    return attention(q, k, v)
+
+
+def attention_fp8_grad(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_scale: float, k_scale: float
+) -> torch.Tensor:
+    """``attention`` whose forward and backward passes run in FP8 where the GPU has kernels.
+
+    Differentiable. Elsewhere this is ``attention``. Where FP8 runs, gradients carry
+    quantization noise.
+
+    Args:
+        q: Queries, shape ``[B, Sq, H, hd]``. After scaling they must stay within 448 in
+            magnitude. See ``norm_scale``.
+        k: Keys, shape ``[B, Sk, H, hd]``, with the same bound after scaling.
+        v: Values, shape ``[B, Sk, H, hd]``. Values beyond 448 in magnitude are clipped.
+        q_scale: Factor the queries are multiplied by before quantizing.
+        k_scale: Factor the keys are multiplied by before quantizing.
+
+    Returns:
+        Attention output with heads merged, shape ``[B, Sq, H * hd]``, dtype of ``q``.
+
+    Raises:
+        RuntimeError: If ``q`` is not on a CUDA device.
+    """
+    if _warpy(q):
+        return warpy.attention_grad(q, k, v, q_scale, k_scale).flatten(2)
     return attention(q, k, v)
 
 
