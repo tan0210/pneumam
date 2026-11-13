@@ -319,8 +319,7 @@ def rowquant(
     return _rowquant(x.contiguous(), gelu, *(scales or (None, None)))
 
 
-@triton.autotune(configs=_ROW_CONFIGS, key=["K"], cache_results=True)
-@triton.jit
+@triton.jit  # not autotuned: tuning reruns a kernel, and this one works in place
 def _scale_kernel(x_ptr, r_ptr, c_ptr, K: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
@@ -333,7 +332,7 @@ def _scale_kernel(x_ptr, r_ptr, c_ptr, K: tl.constexpr, BLOCK: tl.constexpr):
 @torch.library.custom_op("pneumam::scale_rows_cols_", mutates_args=("x",))
 def _scale(x: torch.Tensor, rows: torch.Tensor, cols: torch.Tensor) -> None:
     M, K = x.shape
-    _scale_kernel[(M,)](x, rows, cols, K=K, BLOCK=triton.next_power_of_2(K))
+    _scale_kernel[(M,)](x, rows, cols, K=K, BLOCK=triton.next_power_of_2(K))  # type: ignore
 
 
 def scale_rows_cols_(

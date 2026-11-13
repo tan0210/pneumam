@@ -65,8 +65,9 @@ def add_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument(
         "--graph",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Replay each step and the decode as CUDA graphs. The first batch captures them.",
+        default=False,
+        help="Replay each step and the decode as CUDA graphs. The first batch captures them. "
+        "Needs a warpy-kernels that launches on PyTorch's stream, or the images are wrong.",
     )
     ap.add_argument(
         "--context-length",

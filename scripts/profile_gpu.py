@@ -27,6 +27,15 @@ MODES = ("bf16", "fp8", "fp8+attn")
 FAILURES: list[dict[str, str]] = []
 
 
+def heading(title: str) -> None:
+    """Print a section title underlined with dashes.
+
+    Args:
+        title: The title.
+    """
+    print(f"\n{title}\n{'-' * len(title)}")
+
+
 def attempt(label: str, fn: Callable[[], Any]) -> Any:
     """Run one measurement, recording a failure instead of raising.
 
@@ -243,6 +252,8 @@ def check(args: argparse.Namespace, model: AnimaDiT) -> list[dict[str, Any]]:
         for tr in (False, True)
     ]
     for mode, path, trim in cases:
+        if mode != "bf16" and path == "triton":
+            continue  # the in-tree kernels alone have no FP8 product on this GPU
         label = f"check {mode} path={path or 'auto'} trim={trim}"
         out = attempt(label, lambda m=mode, p=path, tr=trim: velocity(m, p, tr))
         if out is not None:
@@ -256,6 +267,41 @@ def check(args: argparse.Namespace, model: AnimaDiT) -> list[dict[str, Any]]:
             print(
                 f"  {mode:9s} {row['path']:9s} trim={trim!s:5s} rel err {row['rel_err']:.2e}"
             )
+    return rows
+
+
+@torch.no_grad()
+def graph_check(args: argparse.Namespace, model: AnimaDiT) -> list[dict[str, Any]]:
+    """Compare a replayed CUDA graph against the same step run eagerly, on a new input.
+
+    Args:
+        args: Parsed options.
+        model: The model.
+
+    Returns:
+        One row per mode with the relative error of the replay.
+    """
+    device = model.patch.weight.device
+    side = args.check_size // 8
+    x0 = noise(1, side, side, model.cfg.in_ch, 0, device)
+    x1 = noise(1, side, side, model.cfg.in_ch, 1, device)
+    text = make_text(args, model, 2)
+    sg = sigmas(args.steps, model.spec.shift).to(device)
+    rows = []
+    for mode in MODES:
+
+        def run(mode=mode):
+            rt = runtime(model, mode)
+            prep = model.prepare(rt, sg[: args.steps], text)
+            fn = guided(prep.run, 4.0)
+            runner = Graphed(fn, (x0, *prep.per_step(0)), prep.fixed)
+            want = fn(x1, *prep.per_step(3), *prep.fixed)  # not what was captured
+            return rel(runner(x1, *prep.per_step(3)), want)
+
+        err = attempt(f"graph {mode}", run)
+        if err is not None:
+            rows.append({"mode": mode, "rel_err": err})
+            print(f"  {mode:9s} replay vs eager rel err {err:.2e}")
     return rows
 
 
@@ -525,7 +571,8 @@ def trace(
         table = attempt(f"trace {mode}", run)
         if table is not None:
             tables[mode] = table
-            print(f"\n{mode}, three steps:\n{table}")
+            heading(f"{mode}, three steps")
+            print(table)
     return tables
 
 
@@ -546,6 +593,15 @@ def decode(
     """
     decoder = load_decoder(args.vae, device)
     x = noise(args.batch, height // 8, width // 8, decoder.mean.shape[0], 0, device)
+    x1 = noise(args.batch, height // 8, width // 8, decoder.mean.shape[0], 1, device)
+
+    def replay():
+        decoder.decode(x, graph=True)
+        return rel(decoder.decode(x1, graph=True), decoder.decode(x1))
+
+    err = attempt(f"decode replay {width}x{height}", replay)
+    if err is not None:
+        print(f"  replay vs eager rel err {err:.2e}")
     rows = []
     for graph in (False, True):
         label = f"decode {width}x{height} graph={graph}"
@@ -597,7 +653,7 @@ def main(argv: list[str] | None = None) -> int:
         "--skip",
         nargs="*",
         default=[],
-        choices=["check", "steps", "ops", "trace", "decode"],
+        choices=["check", "graph", "steps", "ops", "trace", "decode"],
     )
     ap.add_argument("--out", default="profile_out")
     args = ap.parse_args(argv)
@@ -609,6 +665,7 @@ def main(argv: list[str] | None = None) -> int:
     sizes = [tuple(int(v) for v in s.lower().split("x")) for s in args.sizes]
     sections: list[tuple[str, Callable[[], Any]]] = [
         ("check", lambda: check(args, model)),
+        ("graph", lambda: graph_check(args, model)),
         ("steps", lambda: [r for w, h in sizes for r in steps(args, model, w, h)]),
         (
             "ops",
@@ -630,7 +687,7 @@ def main(argv: list[str] | None = None) -> int:
     for name, fn in sections:
         if name in args.skip:
             continue
-        print(f"\n== {name} ==")
+        heading(name)
         report[name] = attempt(name, fn)
     report["failures"] = FAILURES
     os.makedirs(args.out, exist_ok=True)

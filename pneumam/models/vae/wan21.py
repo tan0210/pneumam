@@ -221,6 +221,7 @@ class Wan21Decoder(_Half):
     def __init__(self, sd: dict[str, torch.Tensor]) -> None:
         super().__init__(sd)
         self.graphs: dict[Any, Graphed] = {}
+        self.register_buffer("phase", _PHASE.clone(), persistent=False)
         self.post_w, self.post_b = _p(sd["post_w"]), _p(sd["post_b"])
         self.in_w, self.in_b = _p(sd["in_w"]), _p(sd["in_b"])
         self.mid0, self.mid1 = _Res(sd, "mid0."), _Res(sd, "mid1.")
@@ -316,11 +317,10 @@ class Wan21Decoder(_Half):
         _put3d(dec.conv_out, self.out_w, 2)
         _put(dec.conv_out.bias, self.out_b)
 
-    @staticmethod
     def _subpixel(
-        w: torch.Tensor, b: torch.Tensor
+        self, w: torch.Tensor, b: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        A = _PHASE.to(w)
+        A = cast(torch.Tensor, self.phase).to(w.dtype)
         w4 = torch.einsum(
             "aij,bkl,ocjl->abocik", A, A, w
         )  # one kernel per output parity
