@@ -62,6 +62,16 @@ venvPath = "."
 venv = ".venv"
 typeCheckingMode = "standard"
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+python_files = ["*.py"]
+addopts = "--import-mode=importlib"
+filterwarnings = [
+    "ignore::DeprecationWarning:(ffpa_attn|quack|cutlass).*",
+    "ignore:cudaGetDeviceCount:UserWarning",
+]
+
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
 warpy-kernels = { git = "https://github.com/tan0210/warpy-kernels" }

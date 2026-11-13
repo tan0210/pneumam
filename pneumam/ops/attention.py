@@ -115,11 +115,13 @@ def attention_quantized(
     return attention(*_dequantize(q, k, v, q_scale, k_scale, v_scale))
 
 
-def trims_fast(q: torch.Tensor) -> bool:
+def trims_fast(q: torch.Tensor, fp8: bool = False) -> bool:
     """Tell whether trimming the context speeds up cross-attention for inputs like ``q``.
 
     Args:
-        q: Representative attention input.
+        q: Representative attention input, shape ``[B, S, H, hd]``.
+        fp8: Whether the attention will run on FP8 operands.
+            See ``cross_attention_trimmed_quantized``.
 
     Returns:
         True if ``cross_attention_trimmed`` skips the trimmed keys. If False it still returns the
@@ -128,7 +130,7 @@ def trims_fast(q: torch.Tensor) -> bool:
     Raises:
         RuntimeError: If ``q`` is not on a CUDA device.
     """
-    return _flash(q) or _warpy(q)
+    return _flash(q) or (fp8 and _warpy(q))
 
 
 def cross_attention_trimmed(

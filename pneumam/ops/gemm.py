@@ -90,14 +90,17 @@ def fp8_supported(device: torch.device) -> bool:
         device: Device to check.
 
     Returns:
-        True if ``fp8_linear`` has an FP8 kernel there. If False it still works, but slowly.
+        True if ``fp8_linear`` has an FP8 kernel there, or if ops are pinned to the reference
+        path. If False it still works, but slowly.
 
     Raises:
         RuntimeError: If ``device`` is not a CUDA device.
     """
     arch = _dispatch.arch(device)
-    return (arch == "sm120" and warpy.available) or (
-        arch in _DATACENTER and triton.available
+    return (
+        arch == "reference"
+        or (arch == "sm120" and warpy.available)
+        or (arch in _DATACENTER and triton.available)
     )
 
 
