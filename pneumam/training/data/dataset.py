@@ -2,20 +2,29 @@ import json
 import os
 import random
 from collections.abc import Iterator
+from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 from safetensors.torch import load_file
 
-from .prepare import FORMAT, INDEX, UNCOND
+from .prepare import FORMAT, INDEX
 
 
-def _pad(context: torch.Tensor, length: int) -> torch.Tensor:
-    if context.shape[1] > length:
-        raise ValueError(
-            f"a caption has {context.shape[1]} tokens, more than the context length {length}"
-        )
-    return F.pad(context, (0, 0, 0, length - context.shape[1]))
+@dataclass
+class Batch:
+    """A batch of training samples of one image size.
+
+    Attributes:
+        latents: Float32 latents in the dataset's layout.
+        captions: Captions as written, one per sample.
+        subsets: Subset index of each sample.
+        control: Control images as uint8 ``[B, 3, H, W]``, or None without control images.
+    """
+
+    latents: torch.Tensor
+    captions: list[str]
+    subsets: list[int]
+    control: torch.Tensor | None = None
 
 
 class ShardedDataset:
@@ -25,9 +34,10 @@ class ShardedDataset:
         root: Folder written by ``prepare``.
 
     Attributes:
-        count: Number of samples.
+        count: Number of distinct samples.
         layout: Latent layout the data was encoded for.
-        shards: One entry per shard file with its ``file``, ``count``, ``width`` and ``height``.
+        shards: One entry per shard file with its ``file``, ``count``, ``width``, ``height``
+            and per-sample ``captions``, ``subsets``, ``repeats`` and ``flips``.
 
     Raises:
         ValueError: If the folder holds no dataset in this format.
@@ -46,72 +56,101 @@ class ShardedDataset:
         self.layout: str = index["layout"]
         self.shards: list[dict] = index["shards"]
 
-    def uncond(self, context_length: int) -> torch.Tensor:
-        """Load the empty-prompt embeddings, for caption dropout.
-
-        Args:
-            context_length: Tokens to zero-pad to.
+    @property
+    def epoch_size(self) -> int:
+        """Samples drawn per epoch, counting repeats.
 
         Returns:
-            Tensor of shape ``[1, context_length, text_dim]``.
-
-        Raises:
-            ValueError: If the empty prompt is longer than ``context_length``.
+            The sum of every sample's repeats.
         """
-        context = load_file(os.path.join(self.root, UNCOND))["context"]
-        return _pad(context, context_length)
+        return sum(sum(s["repeats"]) for s in self.shards)
 
     def batches(
         self,
         batch_size: int,
-        context_length: int,
         seed: int = 0,
         rank: int = 0,
         world: int = 1,
         epochs: int | None = None,
-    ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Iterator[Batch]:
         """Iterate over shuffled batches, each drawn from a single image size.
 
-        Every epoch visits the shards in a new order and shuffles within each shard. With
-        several ranks, each sample goes to exactly one rank per epoch. Samples that do not fill
-        a batch are kept for the next shard of the same image size, also across epochs.
+        Every epoch visits the shards in a new order, draws each sample as often as its repeats
+        say, and shuffles within each shard. Samples that may be flipped are mirrored half of
+        the time, together with their control image. With several ranks, each draw goes to
+        exactly one rank. Samples that do not fill a batch wait for the next shard of the same
+        image size, also across epochs.
 
         Args:
             batch_size: Samples per batch.
-            context_length: Tokens the text embeddings are zero-padded to.
-            seed: Seed of the order. Use the same seed on every rank.
+            seed: Seed of the order and the flips. Use the same seed on every rank.
             rank: Index of this process.
             world: Number of processes sharing the data.
             epochs: Passes over the data. None repeats forever.
 
         Yields:
-            ``(latents, context)`` on the CPU: float32 latents of batch size ``batch_size`` and
-            text embeddings of shape ``[batch_size, context_length, text_dim]``.
-
-        Raises:
-            ValueError: If a caption is longer than ``context_length``.
+            Batches with tensors on the CPU.
         """
-        pending: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        pending: dict[tuple[int, int], Batch] = {}
         epoch = 0
         while epochs is None or epoch < epochs:
-            order = random.Random(seed * 1_000_003 + epoch)
+            rng = random.Random(seed * 1_000_003 + epoch)
             shards = list(self.shards)
-            order.shuffle(shards)
+            rng.shuffle(shards)
             for shard in shards:
-                picks = list(range(shard["count"]))
-                order.shuffle(picks)
-                mine = torch.tensor(picks[rank::world], dtype=torch.long)
-                if mine.numel() == 0:
+                picks = [
+                    i for i in range(shard["count"]) for _ in range(shard["repeats"][i])
+                ]
+                rng.shuffle(picks)
+                flips = [shard["flips"][i] and rng.random() < 0.5 for i in picks]
+                mine = list(range(rank, len(picks), world))
+                if not mine:
                     continue
                 data = load_file(os.path.join(self.root, shard["file"]))
-                latents = data["latents"][mine]
-                context = _pad(data["context"][mine], context_length)
+                index = torch.tensor([picks[j] for j in mine], dtype=torch.long)
+                flip = torch.tensor([flips[j] for j in mine])
+                latents = data["latents"][index]
+                if flip.any():
+                    mirrored = data["latents_flip"][index]
+                    shape = (-1,) + (1,) * (latents.dim() - 1)
+                    latents = torch.where(flip.view(shape), mirrored, latents)
+                control = None
+                if "control" in data:
+                    control = data["control"][index]
+                    control = torch.where(
+                        flip.view(-1, 1, 1, 1), control.flip(-1), control
+                    )
+                got = Batch(
+                    latents,
+                    [shard["captions"][picks[j]] for j in mine],
+                    [shard["subsets"][picks[j]] for j in mine],
+                    control,
+                )
                 size = (shard["width"], shard["height"])
                 if size in pending:
-                    latents = torch.cat([pending[size][0], latents])
-                    context = torch.cat([pending[size][1], context])
-                whole = latents.shape[0] // batch_size * batch_size
+                    got = _join(pending.pop(size), got)
+                whole = len(got.captions) // batch_size * batch_size
                 for i in range(0, whole, batch_size):
-                    yield latents[i : i + batch_size], context[i : i + batch_size]
-                pending[size] = (latents[whole:], context[whole:])
+                    yield _slice(got, i, i + batch_size)
+                if whole < len(got.captions):
+                    pending[size] = _slice(got, whole, len(got.captions))
             epoch += 1
+
+
+def _slice(b: Batch, start: int, end: int) -> Batch:
+    control = None if b.control is None else b.control[start:end]
+    return Batch(
+        b.latents[start:end], b.captions[start:end], b.subsets[start:end], control
+    )
+
+
+def _join(a: Batch, b: Batch) -> Batch:
+    control = None
+    if a.control is not None and b.control is not None:
+        control = torch.cat([a.control, b.control])
+    return Batch(
+        torch.cat([a.latents, b.latents]),
+        a.captions + b.captions,
+        a.subsets + b.subsets,
+        control,
+    )

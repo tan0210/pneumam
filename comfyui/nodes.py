@@ -22,7 +22,6 @@ from .model import LLLITE, LORAS, Denoiser, PneumamConfig, PneumamModel
 CATEGORY = "Pneumam"
 DTYPE = torch.bfloat16
 TEXT_REPO = "circlestone-labs/Anima-Base-v1.0-Diffusers"
-TEXT_COMPONENTS = ["tokenizer", "text_encoder", "t5_tokenizer", "text_conditioner"]
 
 
 class LoadModel:
@@ -70,12 +69,7 @@ class LoadTextEncoder:
         return {"required": {"repo": ("STRING", {"default": TEXT_REPO})}}
 
     def load(self, repo: str):
-        from diffusers.modular_pipelines.modular_pipeline import ModularPipeline
-
-        parts = ModularPipeline.from_pretrained(repo)
-        parts.load_components(TEXT_COMPONENTS, dtype=DTYPE)
-        parts.to(mm.get_torch_device())
-        return (TextEncoder.from_pipeline(parts),)
+        return (TextEncoder.from_repo(repo, mm.get_torch_device(), DTYPE),)
 
 
 class TextEncode:

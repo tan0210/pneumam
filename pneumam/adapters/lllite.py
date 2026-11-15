@@ -5,6 +5,7 @@ from typing import Any, cast
 import torch
 import torch.nn.functional as F
 from safetensors import safe_open
+from safetensors.torch import save_file
 from torch import nn
 
 from ..ops.gemm import (
@@ -158,7 +159,8 @@ class Module(nn.Module):
         Returns:
             Shape ``[B, N, mlp_dim]``.
         """
-        cond = cond + self.depth_embed.to(cond.dtype)
+        dtype = self.down.weight.dtype
+        x, cond = x.to(dtype), cond.to(dtype) + self.depth_embed
         h = F.silu(self.down(x))
         gamma, beta = self.cond_to_film(cond).chunk(2, dim=-1)
         h = self.mid(torch.cat((cond, h), dim=-1))
@@ -407,7 +409,6 @@ class LLLiteLinear(nn.Module):
             cond.shape[0] != x3.shape[0]
         ):  # one control image for a guided or larger batch
             cond = cond.repeat(x3.shape[0] // cond.shape[0], 1, 1)
-        cond = cond.to(x.dtype)
         w = self.weight
         size = w.shape[0] // self.parts
         out3 = out.reshape(x3.shape[0], n, -1)
@@ -454,6 +455,7 @@ class LLLite(nn.Module):
             text = metadata.get("lllite.aspp_dilations", "1,2,4,8")
             dilations = tuple(int(v) for v in text.split(",") if v.strip())
         self.in_ch = in_ch
+        self.metadata = dict(metadata)
         self.masked_input = (
             metadata.get("lllite.inpaint_masked_input", "false").lower() == "true"
         )
@@ -508,6 +510,94 @@ class LLLite(nn.Module):
                 x = x * (1 - m)
             x = torch.cat((x, m * 2 - 1), dim=1)
         return self.conditioning(x)
+
+
+def new_lllite(
+    dim: int,
+    layers: int,
+    targets: tuple[str, ...] = (
+        "self_attn_q_proj",
+        "self_attn_k_proj",
+        "self_attn_v_proj",
+        "mlp_layer1",
+    ),
+    in_ch: int = 3,
+    cond_dim: int = 64,
+    emb_dim: int = 32,
+    mlp_dim: int = 64,
+    resblocks: int = 4,
+    masked_input: bool = False,
+    seed: int = 0,
+) -> LLLite:
+    """Create an untrained ControlNet-LLLite model for Anima.
+
+    Every adapter starts with a zero ``up`` projection, so the model is unchanged until
+    training moves it.
+
+    Args:
+        dim: Width of the model.
+        layers: Number of blocks to adapt, from the first.
+        targets: Projection inputs to adapt. See ``TARGETS``.
+        in_ch: Image channels: 3 for RGB, 4 for inpainting with a mask.
+        cond_dim: Width of the image encoder trunk.
+        emb_dim: Width of the control embeddings.
+        mlp_dim: Width of each adapter.
+        resblocks: Residual blocks in the image encoder.
+        masked_input: For inpainting, zero the image under the mask before encoding it.
+        seed: Seed of the initial weights.
+
+    Returns:
+        The model in float32 on the CPU, with trainable weights.
+
+    Raises:
+        ValueError: If a target is unknown.
+    """
+    unknown = [t for t in targets if t not in TARGETS]
+    if unknown:
+        raise ValueError(
+            f"unknown LLLite targets {unknown}; expected some of {tuple(TARGETS)}"
+        )
+    torch.manual_seed(seed)
+    cond = Conditioning(in_ch, cond_dim, emb_dim, resblocks, ())
+    sd = {"lllite_conditioning1." + k: v for k, v in cond.state_dict().items()}
+    for i in range(layers):
+        for t in targets:
+            mod = Module(dim, emb_dim, mlp_dim)
+            nn.init.zeros_(mod.up.weight)
+            nn.init.zeros_(mod.up.bias)
+            for k, v in mod.state_dict().items():
+                sd[f"lllite_dit_blocks_{i}_{t}.{k}"] = v
+    metadata = {
+        "lllite.version": "2",
+        "lllite.cond_in_channels": str(in_ch),
+        "lllite.cond_dim": str(cond_dim),
+        "lllite.cond_emb_dim": str(emb_dim),
+        "lllite.mlp_dim": str(mlp_dim),
+        "lllite.cond_resblocks": str(resblocks),
+        "lllite.use_aspp": "false",
+        "lllite.inpaint_masked_input": str(masked_input).lower(),
+    }
+    return LLLite(sd, metadata).requires_grad_(True)
+
+
+def save_lllite(
+    lllite: LLLite, path: str | os.PathLike, dtype: torch.dtype = torch.bfloat16
+) -> None:
+    """Write an LLLite model in the format of kohya's sd-scripts, which ComfyUI also reads.
+
+    Args:
+        lllite: The model.
+        path: Output file.
+        dtype: Dtype of the written weights.
+    """
+    sd = {}
+    for k, v in lllite.state_dict().items():
+        if k.startswith("conditioning."):
+            k = "lllite_conditioning1." + k[len("conditioning.") :]
+        elif k.startswith("adapters."):
+            k = k[len("adapters.") :]
+        sd[k] = v.detach().to("cpu", dtype).contiguous()
+    save_file(sd, os.fspath(path), metadata=lllite.metadata)
 
 
 def load_lllite(

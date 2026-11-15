@@ -255,6 +255,44 @@ def convert_lora(
     return out, skipped
 
 
+def export_lora(
+    sd: dict[str, torch.Tensor], dtype: torch.dtype = torch.bfloat16
+) -> dict[str, torch.Tensor]:
+    """Convert a LoRA in the fused layout to ComfyUI naming. The inverse of ``convert_lora``.
+
+    Stock ComfyUI, kohya's sd-scripts and Pneumam all read the result.
+
+    Args:
+        sd: Tensors ``blocks.{layer}.{target}.lora_A`` and ``.lora_B`` with ``alpha / rank``
+            folded into ``lora_B``. See ``lora_state_dict``.
+        dtype: Dtype of the written factors.
+
+    Returns:
+        Tensors ``diffusion_model.blocks.{layer}.{projection}.lora_A.weight``, ``.lora_B.weight``
+        and ``.alpha``, with alpha equal to the rank.
+    """
+    names = {(t, i): name for name, (t, i) in PROJ.items()}
+    out = {}
+    for key, a in sd.items():
+        if not key.endswith(".lora_A"):
+            continue
+        base = key[: -len(".lora_A")]
+        _, layer, target = base.split(".")
+        b = sd[base + ".lora_B"]
+        parts = PARTS[target]
+        rank, size = a.shape[0] // parts, b.shape[0] // parts
+        for i in range(parts):
+            rows, cols = (
+                slice(i * size, (i + 1) * size),
+                slice(i * rank, (i + 1) * rank),
+            )
+            stem = f"diffusion_model.blocks.{layer}.{names[(target, i)]}"
+            out[stem + ".lora_A.weight"] = a[cols].to(dtype).contiguous()
+            out[stem + ".lora_B.weight"] = b[rows, cols].to(dtype).contiguous()
+            out[stem + ".alpha"] = torch.tensor(float(rank))
+    return out
+
+
 @torch.no_grad()
 def merge_lora(
     flat: dict[str, torch.Tensor], lora: dict[str, torch.Tensor], strength: float = 1.0

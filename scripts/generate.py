@@ -27,7 +27,6 @@ PROMPT = (
     "blue sky with clouds."
 )
 NEGATIVE = "worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, sepia"
-TEXT_COMPONENTS = ["tokenizer", "text_encoder", "t5_tokenizer", "text_conditioner"]
 
 
 def add_args(ap: argparse.ArgumentParser) -> None:
@@ -138,15 +137,14 @@ def load_pipeline(args: argparse.Namespace) -> Pipeline:
         fused.enable_fp8(
             model, rt, args.fp8_fast_accum
         )  # after merging: it copies the weights
-    parts = ModularPipeline.from_pretrained(args.repo)
-    parts.load_components(TEXT_COMPONENTS + ([] if args.vae else ["vae"]), dtype=dtype)
-    parts.to(args.device)
     if args.vae:
         decoder = load_decoder(args.vae, args.device, dtype)
     else:
+        parts = ModularPipeline.from_pretrained(args.repo)
+        parts.load_components(["vae"], dtype=dtype)
         decoder = Wan21Decoder.from_diffusers(parts.vae).requires_grad_(False)
         decoder = decoder.to(args.device, dtype).eval()
-    text = TextEncoder.from_pipeline(parts)
+    text = TextEncoder.from_repo(args.repo, args.device, dtype)
     if args.tune:
         rows = 1 if args.cfg == 1.0 else 2
         fused.warmup(

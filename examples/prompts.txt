@@ -1,0 +1,4 @@
+# One preview per line, in the format of kohya's sd-scripts.
+# --n negative prompt, --w/--h size, --d seed, --s steps, --l guidance, --cn control image
+mychar, 1girl, solo, smile, upper body, outdoors --n worst quality, low quality --d 1
+mychar, 1girl, full body, standing, city street at night --w 832 --h 1216 --d 2
