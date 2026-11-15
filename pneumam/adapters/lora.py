@@ -106,14 +106,11 @@ class LoRALinear(nn.Module):
         with torch.no_grad():
             a = self.lora_A.to(dtype)
             bs = (self.lora_B * self.scale).to(dtype)
-        return self.base.weight, self.lora_A, self.lora_B, a, bs, self.scale
+        w8, w8_t = self.fp8 or (None, None)
+        return self.base.weight, self.lora_A, self.lora_B, a, bs, self.scale, w8, w8_t
 
     def _plain(self) -> bool:
-        return (
-            isinstance(self.drop, nn.Identity)
-            and self.fp8 is None
-            and self.base.bias is None
-        )
+        return isinstance(self.drop, nn.Identity) and self.base.bias is None
 
     def fused_mlp(self, down: nn.Module, x: torch.Tensor) -> torch.Tensor | None:
         """Apply this layer, an exact erf GELU and another adapted layer as one step.
@@ -124,7 +121,7 @@ class LoRALinear(nn.Module):
 
         Returns:
             ``down(gelu(self(x)))``, or None if the two layers cannot be fused: ``down`` has no
-            adapter, or either layer uses dropout, a bias or an FP8 base.
+            adapter, or either layer uses dropout or a bias.
         """
         if not (isinstance(down, LoRALinear) and self._plain() and down._plain()):
             return None

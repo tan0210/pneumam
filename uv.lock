@@ -2367,7 +2367,7 @@ wheels = [
 [[package]]
 name = "warpy-kernels"
 version = "0.1.0"
-source = { git = "https://github.com/tan0210/warpy-kernels#0489d9ea7253200febe9c72d86442031d6b6625c" }
+source = { git = "https://github.com/tan0210/warpy-kernels#df385c6e3fcec44cffef096bbc0f37ed17f0f6a2" }
 dependencies = [
     { name = "nvidia-cutlass-dsl" },
     { name = "torch" },

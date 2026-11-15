@@ -211,5 +211,10 @@ def test_adapted_mlp_takes_the_fused_path_and_matches_the_separate_layers():
     want = torch.autograd.grad(separate.square().sum(), leaves)
     assert all(rel(a, c) < 1e-4 for a, c in zip(got, want, strict=True))
     assert b.up.fused_mlp(torch.nn.Linear(4, 4), x) is None
-    L.enable_fp8_base(m)
-    assert b.up.fused_mlp(b.down, x) is None
+    exact = fused_out.detach()
+    for backward in (False, True):
+        L.enable_fp8_base(m, backward)
+        fp8_out = b.up.fused_mlp(b.down, x)
+        assert fp8_out is not None and rel(fp8_out, exact) < 8e-2
+        got = torch.autograd.grad(fp8_out.square().sum(), leaves)
+        assert all(rel(a, c) < 1e-1 for a, c in zip(got, want, strict=True))

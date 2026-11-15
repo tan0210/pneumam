@@ -1,4 +1,3 @@
-import inspect
 import json
 import math
 import os
@@ -16,8 +15,6 @@ except Exception:  # noqa: BLE001  # cutlass can fail to import in ways other th
     available = False
 
 _BM = 128
-# older releases cannot add the product to what the output buffer holds
-_ACCUM = available and "accum" in inspect.signature(_wk.gemm).parameters  # type: ignore
 _DTYPES = (torch.bfloat16, torch.float16)
 TUNE_CACHE_PATH = os.environ.get(
     "PNEUMAM_TUNE_CACHE", os.path.expanduser("~/.cache/pneumam/warpy_gemm.json")
@@ -91,22 +88,40 @@ def _pad_rows(a: torch.Tensor) -> torch.Tensor:
     return buf.view(a.dtype)
 
 
-def _launch(a, w, act, out=None) -> torch.Tensor:
-    y = _wk.gemm(a, w, out=out, act=act, **_tuned_config(_key(a, w, act)))  # type: ignore
+def _launch(a, w, act, out=None, sa=None, sb=None) -> torch.Tensor:
+    tuned = _tuned_config(_key(a, w, act))
+    y = _wk.gemm(a, w, out=out, act=act, scale_a=sa, scale_b=sb, **tuned)  # type: ignore
     return y[0] if act == "gelu" else y  # type: ignore
 
 
-def _run(a: torch.Tensor, w: torch.Tensor, act: str = "") -> torch.Tensor:
+def _pad_scale(s: torch.Tensor) -> torch.Tensor:
+    mp = -(-s.shape[0] // _BM) * _BM
+    out = torch.ones(mp, dtype=s.dtype, device=s.device)
+    out[: s.shape[0]] = s
+    return out
+
+
+def _run(
+    a: torch.Tensor,
+    w: torch.Tensor,
+    act: str = "",
+    sa: torch.Tensor | None = None,
+    sb: torch.Tensor | None = None,
+) -> torch.Tensor:
     m = a.shape[0]
     a, w = a.detach().contiguous(), w.detach()  # the kernel cannot take graph tensors
+    if sa is not None:
+        sa = sa.detach().reshape(-1).contiguous()
     whole = m // _BM * _BM
     if whole == m:
-        return _launch(a, w, act)
+        return _launch(a, w, act, None, sa, sb)
     dtype = torch.bfloat16 if a.dtype == FP8 else a.dtype
     y = torch.empty(m, w.shape[0], dtype=dtype, device=a.device)
     if whole:
-        _launch(a[:whole], w, act, y[:whole])  # the bulk runs in place, uncopied
-    y[whole:] = _launch(_pad_rows(a[whole:]), w, act)[: m - whole]
+        bulk = None if sa is None else sa[:whole]
+        _launch(a[:whole], w, act, y[:whole], bulk, sb)  # the bulk runs in place, uncopied
+    tail = None if sa is None else _pad_scale(sa[whole:])
+    y[whole:] = _launch(_pad_rows(a[whole:]), w, act, None, tail, sb)[: m - whole]
     return y
 
 
@@ -151,6 +166,18 @@ def _fp8_gemm(q: torch.Tensor, wq: torch.Tensor) -> torch.Tensor:
 
 @_fp8_gemm.register_fake
 def _(q, wq):
+    return torch.empty(q.shape[0], wq.shape[0], dtype=torch.bfloat16, device=q.device)
+
+
+@torch.library.custom_op("pneumam::fp8_linear_warpy", mutates_args=())
+def _fp8_linear(
+    q: torch.Tensor, s: torch.Tensor, wq: torch.Tensor, ws: torch.Tensor
+) -> torch.Tensor:
+    return _run(q, wq, "", s, ws)
+
+
+@_fp8_linear.register_fake
+def _(q, s, wq, ws):
     return torch.empty(q.shape[0], wq.shape[0], dtype=torch.bfloat16, device=q.device)
 
 
@@ -292,14 +319,14 @@ def fits_accum(
         pre: The GELU input of ``dgelu_addmm_``, if known.
 
     Returns:
-        True if the installed library can accumulate, the operands are contiguous bf16 or fp16
+        True if the library is installed, the operands are contiguous bf16 or fp16
         of one dtype, ``M`` is a multiple of 128, and the product's output and inner widths are
         multiples of 128 and 64. ``out`` and ``pre``, when given, must also be contiguous with
         the dtype of ``x``.
     """
     n, k = weight.shape[::-1] if transposed else weight.shape
     return (
-        _ACCUM
+        available
         and x.dtype in _DTYPES
         and weight.dtype == x.dtype
         and weight.is_contiguous()
@@ -370,6 +397,113 @@ def dgelu_addmm_(
     return out
 
 
+def fits_accum_fp8(
+    q: torch.Tensor,
+    w: FP8Weight,
+    out: torch.Tensor,
+    pre: torch.Tensor | None = None,
+) -> bool:
+    """Tell whether the accumulating FP8 products can run these operands.
+
+    Args:
+        q: FP8 tokens, shape ``[M, K]``.
+        w: Quantized weight, shape ``[N, K]``.
+        out: The bf16 or fp16 buffer the product is added to, shape ``[M, N]``.
+        pre: The GELU input of ``fp8_dgelu_addmm_``, if any.
+
+    Returns:
+        True if ``fits(q, w.q)`` holds, ``M`` is a multiple of 128, and ``out`` and ``pre`` are
+        contiguous with one dtype.
+    """
+    return (
+        fits(q, w.q)
+        and q.shape[0] % _BM == 0
+        and out.dtype in _DTYPES
+        and all(t is None or (t.dtype == out.dtype and t.is_contiguous()) for t in (out, pre))
+    )
+
+
+def _fp8_call(
+    out: torch.Tensor, q: torch.Tensor, s: torch.Tensor, w: FP8Weight, act: str, **kw
+):
+    q, s = q.detach().contiguous(), s.detach().contiguous()
+    scales = {"a_scale_mx": s} if s.dtype == torch.uint8 else {"scale_a": s.reshape(-1)}
+    tuned = _tuned_config(_key(q, w.q, act)) if act != "dgelu" else {}
+    return _wk.gemm(  # type: ignore
+        q, w.q.detach(), out=out, scale_b=w.s.detach(), act=act, accum=True, **scales, **kw, **tuned
+    )
+
+
+def fp8_addmm_(
+    out: torch.Tensor,
+    q: torch.Tensor,
+    s: torch.Tensor,
+    w: FP8Weight,
+    mx_out: bool = False,
+):
+    """Add the product of FP8 tokens and an FP8 weight to a buffer in place. Forward only.
+
+    Args:
+        out: Buffer accepted by ``fits_accum_fp8``, shape ``[M, N]``.
+        q: FP8 tokens, shape ``[M, K]``.
+        s: Float32 token scales ``[M, 1]``, or uint8 MXFP8 scales ``[M, K / 32]``.
+        w: Quantized weight, shape ``[N, K]``.
+        mx_out: Also return the sum as MXFP8.
+
+    Returns:
+        ``out``, or ``(out, q8, s8)`` with ``mx_out``: e4m3 values ``[M, N]`` and uint8 scales
+        ``[M, N / 32]``.
+    """
+    return _fp8_call(out, q, s, w, "", out_mx=mx_out)
+
+
+def fp8_gelu_addmm_(
+    out: torch.Tensor,
+    q: torch.Tensor,
+    s: torch.Tensor,
+    w: FP8Weight,
+    mx_out: bool = False,
+) -> tuple:
+    """Compute ``gelu(out + product)`` for FP8 tokens and an FP8 weight. Forward only.
+
+    Args:
+        out: Buffer accepted by ``fits_accum_fp8`` holding the addend. It is overwritten.
+        q: FP8 tokens, shape ``[M, K]``.
+        s: Float32 token scales ``[M, 1]``, or uint8 MXFP8 scales ``[M, K / 32]``.
+        w: Quantized weight, shape ``[N, K]``.
+        mx_out: Also return the result as MXFP8.
+
+    Returns:
+        ``(post, pre)``: the result, and the sum the GELU was applied to, followed by
+        ``(q8, s8)`` with ``mx_out``.
+    """
+    return _fp8_call(out, q, s, w, "gelu", store_pre=True, out_mx=mx_out)
+
+
+def fp8_dgelu_addmm_(
+    out: torch.Tensor,
+    q: torch.Tensor,
+    s: torch.Tensor,
+    w: FP8Weight,
+    pre: torch.Tensor,
+    mx_out: bool = False,
+):
+    """Compute ``(out + product) * gelu'(pre)`` in place for FP8 tokens and weight. Forward only.
+
+    Args:
+        out: Buffer accepted by ``fits_accum_fp8`` holding the addend, shape ``[M, N]``.
+        q: FP8 tokens, shape ``[M, K]``.
+        s: Float32 token scales ``[M, 1]``, or uint8 MXFP8 scales ``[M, K / 32]``.
+        w: Quantized weight, shape ``[N, K]``.
+        pre: Input the GELU was applied to, shape ``[M, N]``.
+        mx_out: Also return the result as MXFP8.
+
+    Returns:
+        ``out``, or ``(out, q8, s8)`` with ``mx_out``.
+    """
+    return _fp8_call(out, q, s, w, "dgelu", pre=pre.detach().contiguous(), out_mx=mx_out)
+
+
 def fp8_gemm(q: torch.Tensor, w: FP8Weight) -> torch.Tensor:
     """Multiply FP8 tokens by an FP8 weight without applying either scale. Forward only.
 
@@ -399,9 +533,8 @@ def fp8_linear(
     Returns:
         bfloat16 result, shape ``[B, S, N]``.
     """
-    B, S, _ = q.shape
-    y = fp8_gemm(q, w).view(B * S, -1)
-    return y.mul_(s).mul_(w.s.view(1, -1)).view(B, S, -1)
+    B, S, K = q.shape
+    return _fp8_linear(q.reshape(B * S, K), s, w.q, w.s).view(B, S, -1)
 
 
 def warmup(

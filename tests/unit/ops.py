@@ -300,6 +300,19 @@ def test_lora_mlp_matches_the_dense_formula_and_its_gradients():
     assert all(rel(a, b) < 1e-4 for a, b in zip(got, want, strict=True))
 
 
+def test_lora_mlp_with_fp8_bases_stays_close_to_the_dense_formula():
+    x, up, down, dense, leaves = lora_mlp_case()
+    w1, w2 = up[0], down[0]
+    up8 = (*up, gemm.quantize_weight(w1), gemm.quantize_weight(w1.T.contiguous()))
+    down8 = (*down, gemm.quantize_weight(w2), gemm.quantize_weight(w2.T.contiguous()))
+    out = lora.lora_mlp(x, up8, down8)
+    assert rel(out, dense) < 5e-2
+    cot = torch.randn_like(dense)
+    got = torch.autograd.grad((out * cot).sum(), leaves)
+    want = torch.autograd.grad((dense * cot).sum(), leaves)
+    assert all(rel(a, b) < 1e-1 for a, b in zip(got, want, strict=True))
+
+
 def test_accumulating_products_with_a_stand_in_kernel(monkeypatch):
     gelu = torch.nn.functional.gelu
     calls = []
@@ -329,7 +342,7 @@ def test_accumulating_products_with_a_stand_in_kernel(monkeypatch):
 
     monkeypatch.setattr(warpy, "_wk", type("W", (), {"gemm": staticmethod(fake_gemm)}))
     monkeypatch.setattr(warpy, "_key", lambda a, w, act: "k")
-    monkeypatch.setattr(warpy, "_ACCUM", True)
+    monkeypatch.setattr(warpy, "available", True)
     monkeypatch.setattr(gemm._dispatch, "arch", lambda device: "sm120")
     x, up, down, dense, leaves = lora_mlp_case()
     bf = lambda t: t.to(torch.bfloat16) if isinstance(t, torch.Tensor) else t
@@ -349,5 +362,5 @@ def test_accumulating_products_with_a_stand_in_kernel(monkeypatch):
     assert all(rel(a, b) < 0.05 for a, b in zip(got, want, strict=True))
     assert calls == [("gelu", False), ("", False), ("dgelu", True), ("", True)]
     assert not warpy.fits_accum(xb[:100], bf(up[0]))
-    monkeypatch.setattr(warpy, "_ACCUM", False)
+    monkeypatch.setattr(warpy, "available", False)
     assert not warpy.fits_accum(xb, bf(up[0]))

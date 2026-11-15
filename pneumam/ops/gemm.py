@@ -9,6 +9,9 @@ __all__ = [
     "FP8Weight",
     "addmm_",
     "dgelu_addmm_",
+    "fp8_addmm_",
+    "fp8_dgelu_addmm_",
+    "fp8_gelu_addmm_",
     "fp8_linear",
     "fp8_linear_unscaled",
     "fp8_supported",
@@ -17,6 +20,8 @@ __all__ = [
     "linear",
     "linear_gelu",
     "mlp",
+    "mx_dequantize",
+    "mx_quantize",
     "quantize_weight",
     "rowquant",
     "warmup",
@@ -131,6 +136,8 @@ def fp8_linear(
     Raises:
         RuntimeError: If ``q`` is not on a CUDA device.
     """
+    if _dispatch.arch(q.device) == "sm120" and warpy.fits(q, w.q):
+        return warpy.fp8_linear(q, s, w)
     y, scales = fp8_linear_unscaled(q, s, w, fast_accum)
     if scales is None:
         return y
@@ -371,3 +378,143 @@ def dgelu_addmm_(
     if _dispatch.arch(g.device) == "sm120" and warpy.fits_accum(g, weight, True, out=out, pre=pre):
         return warpy.dgelu_addmm_(out, g, weight, pre)
     return out.addmm_(g, weight).mul_(_gelu_slope(pre).to(out.dtype))
+
+
+def _sm120_fp8(q: torch.Tensor, w: FP8Weight, out: torch.Tensor, pre=None) -> bool:
+    return _dispatch.arch(q.device) == "sm120" and warpy.fits_accum_fp8(q, w, out, pre)
+
+
+def mx_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a matrix to MXFP8: e4m3 values with a power-of-two scale per 32 columns.
+
+    Each block's scale is the smallest power of two that keeps its values within 448.
+
+    Args:
+        x: Matrix of any floating dtype, shape ``[M, N]`` with ``N`` a multiple of 32.
+
+    Returns:
+        ``(q, s)``: e4m3 values ``[M, N]`` and uint8 ue8m0 scales ``[M, N / 32]``.
+    """
+    m, n = x.shape
+    blocks = x.float().view(m, n // 32, 32)
+    amax = blocks.abs().amax(-1).clamp_min(2.0**-126)
+    e = torch.ceil(torch.log2(amax / 448.0)).clamp(-127, 127)
+    q = (blocks * torch.exp2(-e)[..., None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return q.view(m, n), (e + 127).to(torch.uint8)
+
+
+def mx_dequantize(q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """Undo ``mx_quantize``.
+
+    Args:
+        q: e4m3 values, shape ``[M, N]``.
+        s: uint8 ue8m0 scales, shape ``[M, N / 32]``.
+
+    Returns:
+        Float32 values, shape ``[M, N]``.
+    """
+    return q.float() * torch.exp2(s.float() - 127).repeat_interleave(32, dim=1)
+
+
+def _fp8_product(q: torch.Tensor, s: torch.Tensor, w: FP8Weight) -> torch.Tensor:
+    if s.dtype == torch.uint8:
+        return (mx_dequantize(q, s) @ w.q.float().T) * w.s
+    return fp8_linear(q[None], s, w)[0].float()
+
+
+def _with_mx(out: torch.Tensor, mx_out: bool):
+    return (out, *mx_quantize(out)) if mx_out else out
+
+
+def fp8_addmm_(
+    out: torch.Tensor,
+    q: torch.Tensor,
+    s: torch.Tensor,
+    w: FP8Weight,
+    mx_out: bool = False,
+):
+    """Add the product of FP8 tokens and an FP8 weight to a buffer in place. Forward only.
+
+    Args:
+        out: Contiguous bf16 or fp16 buffer, shape ``[M, N]``.
+        q: FP8 tokens, shape ``[M, K]``.
+        s: Float32 token scales ``[M, 1]`` from ``rowquant``, or uint8 MXFP8 scales
+            ``[M, K / 32]``. See ``mx_quantize``.
+        w: Weight from ``quantize_weight``, shape ``[N, K]``.
+        mx_out: Also return the sum as MXFP8.
+
+    Returns:
+        ``out``, now holding the sum, or ``(out, q8, s8)`` with ``mx_out``.
+
+    Raises:
+        RuntimeError: If ``q`` is not on a CUDA device.
+    """
+    if _sm120_fp8(q, w, out):
+        return warpy.fp8_addmm_(out, q, s, w, mx_out)
+    return _with_mx(out.add_(_fp8_product(q, s, w).to(out.dtype)), mx_out)
+
+
+def fp8_gelu_addmm_(
+    out: torch.Tensor,
+    q: torch.Tensor,
+    s: torch.Tensor,
+    w: FP8Weight,
+    mx_out: bool = False,
+) -> tuple:
+    """Compute ``gelu(out + product)`` for FP8 tokens and an FP8 weight. Forward only.
+
+    The GELU is the exact erf GELU.
+
+    Args:
+        out: Contiguous bf16 or fp16 buffer holding the addend, shape ``[M, N]``. It is
+            overwritten.
+        q: FP8 tokens, shape ``[M, K]``.
+        s: Float32 token scales ``[M, 1]``, or uint8 MXFP8 scales ``[M, K / 32]``.
+        w: Weight from ``quantize_weight``, shape ``[N, K]``.
+        mx_out: Also return the result as MXFP8.
+
+    Returns:
+        ``(post, pre)``: the result, and the sum the GELU was applied to, followed by
+        ``(q8, s8)`` with ``mx_out``. One of ``post`` and ``pre`` reuses ``out``.
+
+    Raises:
+        RuntimeError: If ``q`` is not on a CUDA device.
+    """
+    if _sm120_fp8(q, w, out):
+        return warpy.fp8_gelu_addmm_(out, q, s, w, mx_out)
+    pre = fp8_addmm_(out, q, s, w)
+    post = F.gelu(pre) # type: ignore
+    return (post, pre, *mx_quantize(post)) if mx_out else (post, pre)
+
+
+def fp8_dgelu_addmm_(
+    out: torch.Tensor,
+    q: torch.Tensor,
+    s: torch.Tensor,
+    w: FP8Weight,
+    pre: torch.Tensor,
+    mx_out: bool = False,
+):
+    """Compute ``(out + product) * gelu'(pre)`` in place for FP8 tokens and weight. Forward only.
+
+    This is the backward step through a GELU and the linear layer after it, with the gradient
+    quantized and the weight given transposed.
+
+    Args:
+        out: Contiguous bf16 or fp16 buffer holding the addend, shape ``[M, N]``.
+        q: Quantized gradient of the linear layer's output, shape ``[M, K]``.
+        s: Its float32 scales ``[M, 1]``, or uint8 MXFP8 scales ``[M, K / 32]``.
+        w: ``quantize_weight(weight.T)`` of the linear layer, shape ``[N, K]``.
+        pre: Input the GELU was applied to, shape ``[M, N]``.
+        mx_out: Also return the result as MXFP8.
+
+    Returns:
+        ``out``, now holding the gradient of ``pre``, or ``(out, q8, s8)`` with ``mx_out``.
+
+    Raises:
+        RuntimeError: If ``q`` is not on a CUDA device.
+    """
+    if _sm120_fp8(q, w, out, pre):
+        return warpy.fp8_dgelu_addmm_(out, q, s, w, pre, mx_out)
+    out = fp8_addmm_(out, q, s, w).mul_(_gelu_slope(pre).to(out.dtype)) # type: ignore
+    return _with_mx(out, mx_out)
