@@ -88,7 +88,7 @@ def test_scan_finds_control_images_or_fails(folder, tmp_path):
     for i in range(12):
         Image.new("RGB", (10, 10)).save(control / f"{i:02d}.jpg")
     samples = scan_folder(folder, control_dir=control)
-    assert samples[0].control.endswith("00.jpg") # type: ignore
+    assert samples[0].control.endswith("00.jpg")  # type: ignore
     (control / "05.jpg").unlink()
     with pytest.raises(ValueError, match="no control image"):
         scan_folder(folder, control_dir=control)
@@ -170,7 +170,7 @@ def test_repeats_flips_and_control_images(tmp_path):
         mirrored = b.control[0, 0, 0, 0] == 0  # type: ignore # the white half moved to the right
         left = b.latents[0, :, 0, 0].mean() > b.latents[0, :, -1, 0].mean()
         assert bool(left) != bool(mirrored)
-    assert 0 < sum(bool(b.control[0, 0, 0, 0] == 0) for b in batches) < 10 # type: ignore
+    assert 0 < sum(bool(b.control[0, 0, 0, 0] == 0) for b in batches) < 10  # type: ignore
 
 
 def test_errors(dataset, tmp_path):
@@ -197,3 +197,33 @@ def test_caption_rules_follow_kohya():
     assert kept.apply("a, b ||| c, d", rng) == "a, b"
     assert CaptionRules(dropout=1.0).apply("a, b", rng) == ""
     assert CaptionRules(suffix="end").apply("a,  b ,", rng) == "a, b, end"
+
+
+def test_only_flipping_samples_get_mirrored_latents(tmp_path):
+    root = tmp_path / "set"
+    root.mkdir()
+    for i in range(2):
+        Image.new("RGB", (64, 64), (200, 10 * i, 0)).save(root / f"{i}.png")
+    samples = [scan_folder(root)[0], scan_folder(root, flip=True)[1]]
+    prepare(samples, tmp_path / "d", FakeEncoder(), buckets=[(64, 64)])
+    from safetensors.torch import load_file
+
+    shard = ShardedDataset(tmp_path / "d").shards[0]
+    data = load_file(tmp_path / "d" / shard["file"])
+    flips = shard["flips"]
+    assert data["latents_flip"][flips.index(False)].abs().max() == 0
+    assert data["latents_flip"][flips.index(True)].abs().max() > 0
+
+
+def test_exif_rotation_is_applied(tmp_path):
+    root = tmp_path / "set"
+    root.mkdir()
+    img = Image.new("RGB", (64, 128))
+    exif = img.getexif()
+    exif[0x0112] = 6  # stored sideways, shown rotated 90 degrees
+    img.save(root / "0.jpg", exif=exif)
+    prepare(
+        scan_folder(root), tmp_path / "d", FakeEncoder(), buckets=[(64, 128), (128, 64)]
+    )
+    shard = ShardedDataset(tmp_path / "d").shards[0]
+    assert (shard["width"], shard["height"]) == (128, 64)

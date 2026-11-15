@@ -1,12 +1,17 @@
 import os
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
 from torch import nn
 
 
-def setup() -> tuple[int, int, torch.device]:
+def setup(timeout: timedelta = timedelta(hours=2)) -> tuple[int, int, torch.device]:
     """Join multi-GPU training when launched by ``torchrun``, and use one GPU otherwise.
+
+    Args:
+        timeout: How long a collective, such as a barrier, waits for the other ranks. Make it
+            longer than any work one rank does alone, such as encoding a dataset.
 
     Returns:
         ``(rank, world_size, device)`` for this process.
@@ -16,7 +21,7 @@ def setup() -> tuple[int, int, torch.device]:
     device = torch.device("cuda", local)
     if "RANK" not in os.environ:
         return 0, 1, device
-    dist.init_process_group("nccl")
+    dist.init_process_group("nccl", timeout=timeout)
     return dist.get_rank(), dist.get_world_size(), device
 
 

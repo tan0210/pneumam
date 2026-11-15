@@ -66,6 +66,15 @@ def test_build_reuses_the_cache_until_the_data_changes(tmp_path):
     build_datasets(load_datasets(cfg), tmp_path / "cache", enc, "BHWC")
     assert enc.calls == calls
     (images / "1.txt").write_text("changed")
+    cfg.write_text(cfg.read_text().replace("num_repeats = 2", "num_repeats = 3"))
+    sets, _ = build_datasets(
+        load_datasets(cfg), tmp_path / "cache", None, "BHWC", encode=False
+    )
+    assert enc.calls == calls  # captions and repeats are not encoded, so nothing is
+    assert sets[0].epoch_size == 9
+    assert "changed" in [c for s in sets[0].shards for c in s["captions"]]
+    Image.new("RGB", (64, 64), (9, 9, 9)).save(images / "1.png")
+    os.utime(images / "1.png", (1, 1))
     with pytest.raises(ValueError, match="not encoded"):
         build_datasets(
             load_datasets(cfg), tmp_path / "cache", None, "BHWC", encode=False
@@ -84,3 +93,20 @@ def test_prompt_files_skip_comments_and_resolve_control_images(tmp_path):
     assert second.width == 512 and second.control == os.path.normpath(
         str(tmp_path / "ctl/x.png")
     )
+
+
+def test_context_padding_refuses_to_crop():
+    from pneumam.models.anima.text import pad_context
+
+    assert pad_context(torch.ones(1, 3, 4), 5).shape == (1, 5, 4)
+    with pytest.raises(ValueError, match="more than"):
+        pad_context(torch.ones(1, 6, 4), 5)
+
+
+def test_graph_caches_drop_the_oldest_entry():
+    from pneumam.graphs import remember
+
+    cache: dict = {}
+    for i in range(5):
+        remember(cache, i, str(i), limit=3)
+    assert list(cache) == [2, 3, 4]

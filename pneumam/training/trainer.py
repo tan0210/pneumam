@@ -215,7 +215,8 @@ class Trainer:
 
         Args:
             path: Output file. It holds the trained parameters, the optimizer state, the
-                average, the step count, the noise generator and the settings.
+                average, the step count, the noise generator and the settings. It is replaced
+                in one step, so a crash while saving leaves the previous file intact.
         """
         state = {
             "step": self.step,
@@ -225,7 +226,9 @@ class Trainer:
             "ema": None if self.ema is None else [t.cpu() for t in self.ema],
             "generator": self.generator.get_state(),
         }
-        torch.save(state, path)
+        tmp = os.fspath(path) + ".tmp"
+        torch.save(state, tmp)
+        os.replace(tmp, path)  # a crash mid-write keeps the previous state
 
     def load(self, path: str | os.PathLike) -> None:
         """Restore a run saved by ``save`` into this trainer.

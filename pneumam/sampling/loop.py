@@ -3,7 +3,7 @@ from typing import Any
 
 import torch
 
-from ..graphs import Graphed
+from ..graphs import Graphed, remember
 from ..runtime import Runtime
 from .guidance import guided
 from .samplers.er_sde import er_sde
@@ -79,7 +79,7 @@ def sample(
         key = (shapes, prep.key, None if uncond is None else scale)
         runner = rt.graphs.get(key)
         if runner is None:
-            runner = rt.graphs[key] = Graphed(fn, varying, prep.fixed)
+            runner = remember(rt.graphs, key, Graphed(fn, varying, prep.fixed))
         runner.rebind(*prep.fixed)
 
     def velocity(i: int, z: torch.Tensor) -> torch.Tensor:

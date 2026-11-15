@@ -10,7 +10,7 @@ from typing import Any
 from .buckets import make_buckets
 from .captions import CaptionRules
 from .dataset import Batch, ShardedDataset
-from .prepare import Sample, prepare, scan_folder
+from .prepare import INDEX, Sample, prepare, scan_folder
 
 
 @dataclass
@@ -134,21 +134,43 @@ def load_datasets(path: str | os.PathLike) -> list[Dataset]:
     return out
 
 
-def _key(ds: Dataset, samples: list[Sample], vae: str) -> str:
+def _key(ds: Dataset, samples: list[Sample], vae: str, layout: str) -> str:
+    # only what the encoded tensors depend on; captions and repeats are refreshed in place
     files = [
         (
             s.image,
             os.path.getmtime(s.image),
-            s.caption,
-            s.subset,
-            s.repeats,
             s.flip,
             s.control,
+            None if s.control is None else os.path.getmtime(s.control),
         )
         for s in samples
     ]
-    data = [files, ds.resolution, ds.bucket_reso_steps, ds.max_aspect, vae]
+    data = [files, ds.resolution, ds.bucket_reso_steps, ds.max_aspect, vae, layout]
     return hashlib.sha1(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _refresh(folder: str, samples: list[Sample]) -> None:
+    path = os.path.join(folder, INDEX)
+    with open(path, encoding="utf-8") as f:
+        index = json.load(f)
+    by_image = {s.image: s for s in samples}
+    changed = False
+    for shard in index["shards"]:
+        now = [by_image[i] for i in shard["images"]]
+        fields = {
+            "captions": [s.caption for s in now],
+            "subsets": [s.subset for s in now],
+            "repeats": [s.repeats for s in now],
+        }
+        for name, value in fields.items():
+            if shard[name] != value:
+                shard[name], changed = value, True
+    if changed:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(index, f, indent=1)
+        os.replace(tmp, path)
 
 
 def build_datasets(
@@ -161,8 +183,10 @@ def build_datasets(
 ) -> tuple[list[ShardedDataset], list[CaptionRules]]:
     """Encode datasets into shards, reusing earlier encodings of unchanged data.
 
-    Each dataset is cached under a name derived from its files, captions and settings, so
-    editing a caption or adding an image encodes that dataset again and nothing else.
+    Each dataset is cached under a name derived from its images, control images and settings,
+    so adding or changing an image encodes that dataset again and nothing else. Captions,
+    repeats and subset settings are not encoded, so changing them only updates the cache's
+    index.
 
     In a multi-GPU run, let one rank call this first with ``encode=True`` and the others after
     a barrier, so the data is encoded once.
@@ -198,9 +222,11 @@ def build_datasets(
         if not samples:
             raise ValueError(f"dataset {d} has no images")
         folder = os.path.join(
-            os.fspath(cache_dir), f"dataset-{d}-{_key(ds, samples, vae_id)}"
+            os.fspath(cache_dir), f"dataset-{d}-{_key(ds, samples, vae_id, layout)}"
         )
-        if not os.path.exists(os.path.join(folder, "index.json")):
+        if os.path.exists(os.path.join(folder, INDEX)):
+            _refresh(folder, samples)
+        else:
             if not encode:
                 raise ValueError(f"dataset {d} is not encoded yet")
             buckets = make_buckets(

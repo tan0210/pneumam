@@ -70,8 +70,8 @@ def add_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument(
         "--context-length",
         type=int,
-        default=None,
-        help="Pad text embeddings to this many tokens. 512 matches Diffusers.",
+        default=512,
+        help="Pad text embeddings to this many tokens. 512 matches training and Diffusers.",
     )
     ap.add_argument("--prompt", default=PROMPT)
     ap.add_argument("--negative", default=NEGATIVE)
@@ -87,6 +87,12 @@ def add_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--s-noise", type=float, default=1.0)
     ap.add_argument("--noise-scale", choices=NOISE_SCALES, default="er")
     ap.add_argument("--seed", type=int, default=0, help="Seed of the first image.")
+    ap.add_argument("--batch", type=int, default=1, help="Images denoised together.")
+    ap.add_argument(
+        "--tune",
+        action="store_true",
+        help="Tune the GPU kernels for this size and batch first. Slow the first time, then cached.",
+    )
 
 
 def read_adapter(spec: str, architecture: str) -> tuple[dict[str, torch.Tensor], float]:
@@ -105,10 +111,15 @@ def read_adapter(spec: str, architecture: str) -> tuple[dict[str, torch.Tensor],
     path, strength = spec, 1.0
     head, sep, tail = spec.rpartition(":")
     if sep and not os.path.exists(spec):
-        path, strength = head, float(tail)
+        try:
+            path, strength = head, float(tail)
+        except ValueError:
+            pass  # a colon that is part of the path, such as a Windows drive letter
     try:
         return read_lora(path, architecture)[0], strength
-    except ValueError:
+    except ValueError as e:
+        if "is not a" not in str(e):
+            raise SystemExit(f"{path}: {e}") from e  # a Pneumam file for another model
         sd, skipped = convert_lora(load_file(path))  # a third-party file
     if not sd:
         raise SystemExit(f"{path} holds no adapter tensors for this model")
@@ -174,12 +185,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     add_args(ap)
     ap.add_argument("--count", type=int, default=1, help="Number of images.")
-    ap.add_argument(
-        "--tune",
-        action="store_true",
-        help="Tune the GPU kernels for this size and batch first. Slow the first time, then cached.",
-    )
-    ap.add_argument("--batch", type=int, default=1, help="Images denoised together.")
     ap.add_argument("--out", default="generate_out")
     args = ap.parse_args(argv)
     if args.count < 1 or args.batch < 1:

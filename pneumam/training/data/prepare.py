@@ -99,6 +99,13 @@ def scan_folder(
     return sorted(samples, key=lambda s: s.image)
 
 
+def _open(path: str) -> Any:
+    from PIL import Image, ImageOps
+
+    with Image.open(path) as im:
+        return ImageOps.exif_transpose(im)  # photos stored rotated are turned upright
+
+
 def _to_tensor(image: Any) -> torch.Tensor:
     data = torch.frombuffer(
         bytearray(image.convert("RGB").tobytes()), dtype=torch.uint8
@@ -140,8 +147,6 @@ def prepare(
         ValueError: If ``samples`` is empty, or some samples have a control image and others
             do not.
     """
-    from PIL import Image
-
     buckets = buckets or make_buckets()
     samples = list(samples)
     if not samples:
@@ -151,7 +156,7 @@ def prepare(
         raise ValueError("either every sample has a control image or none has")
     groups: dict[tuple[int, int], list[Sample]] = {}
     for s in samples:
-        with Image.open(s.image) as im:
+        with _open(s.image) as im:
             groups.setdefault(pick_bucket(im.width, im.height, buckets), []).append(s)
     os.makedirs(out_dir, exist_ok=True)
     device = encoder.mean.device
@@ -170,6 +175,7 @@ def prepare(
             {
                 "file": name,
                 "count": len(held),
+                "images": [s.image for s in held],
                 "width": size[0],
                 "height": size[1],
                 "captions": [s.caption for s in held],
@@ -187,16 +193,23 @@ def prepare(
             chunk = group[i : i + batch_size]
             pixels = []
             for s in chunk:
-                with Image.open(s.image) as im:
+                with _open(s.image) as im:
                     pixels.append(_to_tensor(fit(im, size)))
             images = torch.stack(pixels).to(device).float() / 127.5 - 1.0
-            latents.append(encoder.encode(images, layout).float().cpu())
+            lat = encoder.encode(images, layout).float().cpu()
+            latents.append(lat)
             if any(s.flip for s in group):
-                flipped.append(encoder.encode(images.flip(-1), layout).float().cpu())
+                # only samples that may be drawn mirrored are encoded mirrored, the rest stay zero
+                mirrored = torch.zeros_like(lat)
+                which = [j for j, s in enumerate(chunk) if s.flip]
+                if which:
+                    picked = images[which].flip(-1)
+                    mirrored[which] = encoder.encode(picked, layout).float().cpu()
+                flipped.append(mirrored)
             if chunk[0].control is not None:
                 ctl = []
                 for s in chunk:
-                    with Image.open(s.control) as im:  # type: ignore[arg-type]
+                    with _open(s.control) as im:  # type: ignore[arg-type]
                         ctl.append(_to_tensor(fit(im, size)))
                 controls.append(torch.stack(ctl))
             held += chunk

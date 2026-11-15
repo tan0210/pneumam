@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from safetensors.torch import load_file
 from torch import nn
 
-from ...graphs import Graphed
+from ...graphs import Graphed, remember
 
 QWEN_PAD = 151643  # <|endoftext|>
 BUCKET = (
@@ -25,7 +25,14 @@ def pad_context(ctx: torch.Tensor, length: int) -> torch.Tensor:
 
     Returns:
         Tensor of shape ``[B, length, text_dim]``.
+
+    Raises:
+        ValueError: If the embeddings are longer than ``length``.
     """
+    if ctx.shape[1] > length:
+        raise ValueError(
+            f"text embeddings have {ctx.shape[1]} tokens, more than {length}"
+        )
     return F.pad(ctx, (0, 0, 0, length - ctx.shape[1]))
 
 
@@ -407,7 +414,7 @@ class TextEncoder:
         key = tuple(t.shape for t in inputs)
         runner = self.graphs.get(key)
         if runner is None:
-            runner = self.graphs[key] = Graphed(self._run, inputs)
+            runner = remember(self.graphs, key, Graphed(self._run, inputs), 32)
         return runner(*inputs).to(dtype)
 
     def _run(self, ids, mask, t5_ids, t5_mask) -> torch.Tensor:

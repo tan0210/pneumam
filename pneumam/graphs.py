@@ -1,4 +1,5 @@
 from collections.abc import Callable, Sequence
+from typing import Any
 
 import torch
 
@@ -12,6 +13,26 @@ def _pool():
     if _POOL is None:
         _POOL = torch.cuda.graph_pool_handle()
     return _POOL
+
+
+def remember(cache: dict, key: Any, value: Any, limit: int = 16) -> Any:
+    """Store a captured graph, dropping the oldest ones beyond ``limit``.
+
+    Graphs hold on to their memory. Dropping old ones lets later captures reuse it.
+
+    Args:
+        cache: The cache, oldest entry first.
+        key: Key of the new entry.
+        value: The new entry.
+        limit: Most entries kept.
+
+    Returns:
+        ``value``.
+    """
+    while len(cache) >= limit:
+        cache.pop(next(iter(cache)))
+    cache[key] = value
+    return value
 
 
 class Graphed:

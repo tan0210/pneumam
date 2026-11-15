@@ -18,7 +18,7 @@ from pneumam.adapters.lllite import (
     load_lllite,
 )
 from pneumam.adapters.lora import merge_lora, read_lora
-from pneumam.graphs import Graphed
+from pneumam.graphs import Graphed, remember
 from pneumam.models.anima import fused
 from pneumam.models.anima.convert import convert_lora
 from pneumam.models.anima.dit import AnimaDiT, Context
@@ -152,9 +152,15 @@ class Denoiser(nn.Module):
             self._reset()
         if spec is None:
             return
-        key = (id(spec["image"]), id(spec["mask"]), height, width)
-        if key == self._control_key:
-            return
+        key = (spec["image"], spec["mask"], height, width)
+        old = self._control_key
+        if (
+            old is not None
+            and old[0] is key[0]
+            and old[1] is key[1]
+            and old[2:] == key[2:]
+        ):
+            return  # the same tensors, kept alive here, so the cached embedding still fits
         lllite = self._lllites[spec["path"]]
         size = (width * 8, height * 8)
         image = spec["image"][..., :3].movedim(-1, 1)
@@ -186,6 +192,8 @@ class Denoiser(nn.Module):
             fused.enable_fp8(
                 self.dit, self.rt, self.rt.fp8_fast_accum
             )  # it copies the weights
+        if self._control is not None:
+            self._control.refresh()  # LLLite folds the projection weights into its buffers
         self._loras = loras
         self._reset()
 
@@ -240,8 +248,9 @@ class Denoiser(nn.Module):
             def step(z, t, *tensors):
                 return fused.forward(dit, rt, z, t, ctx.replace(tensors))
 
-            runner = Graphed(step, (z, t), tuple(ctx.tensors()))
-            self.rt.graphs[key] = runner
+            runner = remember(
+                self.rt.graphs, key, Graphed(step, (z, t), tuple(ctx.tensors()))
+            )
             runner.bound = ctx  # type: ignore[attr-defined]
         elif runner.bound is not ctx:
             runner.rebind(*ctx.tensors())
