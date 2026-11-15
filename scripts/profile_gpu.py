@@ -570,6 +570,8 @@ def tune(
 TRAIN_VARIANTS = (
     ("bf16", False, False, False),
     ("fp8 attention", False, False, True),
+    ("fp8 base forward+backward", True, True, False),
+    ("fp8 base forward+backward + fp8 attention", True, True, True),
 )
 
 
@@ -654,23 +656,30 @@ def train(
                     v = model.velocity(rt, xt, sg, text)
                     return torch.nn.functional.mse_loss(v.float(), target)
 
-                def forward_backward(loss_fn=loss_fn):
+                def forward_backward(loss_fn=loss_fn, with_input=False):
                     for p in params:
                         p.grad = None  # a graphed step leaves its gradients attached
-                    loss_fn(*inputs).backward()
+                    xt = inputs[0].detach().requires_grad_(with_input)
+                    loss_fn(xt, *inputs[1:]).backward()
                     grads = [p.grad for p in params]
                     for p in params:
                         p.grad = None
-                    return grads
+                    return (grads, xt.grad) if with_input else grads
 
                 def measure(
                     tag=tag, loss_fn=loss_fn, forward_backward=forward_backward
                 ):
                     nonlocal reference
-                    eager = flat(forward_backward())
+                    grads, dx = forward_backward(with_input=True)
+                    eager = flat(grads)
                     if reference is None:
-                        reference = eager
-                    note = f"gradient cosine vs bf16 {cosine(eager, reference, dim=0).item():.4f}"
+                        reference = (eager, dx)
+                    ref, ref_dx = reference
+                    note = (
+                        f"vs bf16: LoRA grad rel err {rel(eager, ref):.1e} "
+                        f"cos {cosine(eager, ref, dim=0).item():.4f}, "
+                        f"input grad rel err {rel(dx, ref_dx):.1e}"
+                    )
                     add(f"{tag}: eager", forward_backward, note)
                     runner = GraphedStep(loss_fn, params)
                     runner(*inputs)
