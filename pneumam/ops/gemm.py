@@ -328,7 +328,9 @@ def addmm_(
     Raises:
         RuntimeError: If ``x`` is not on a CUDA device.
     """
-    if _dispatch.arch(x.device) == "sm120" and warpy.fits_accum(x, weight, transposed, out=out):
+    if _dispatch.arch(x.device) == "sm120" and warpy.fits_accum(
+        x, weight, transposed, out=out
+    ):
         return warpy.addmm_(out, x, weight, transposed)
     return out.addmm_(x, weight if transposed else weight.T)
 
@@ -375,7 +377,9 @@ def dgelu_addmm_(
     Raises:
         RuntimeError: If ``g`` is not on a CUDA device.
     """
-    if _dispatch.arch(g.device) == "sm120" and warpy.fits_accum(g, weight, True, out=out, pre=pre):
+    if _dispatch.arch(g.device) == "sm120" and warpy.fits_accum(
+        g, weight, True, out=out, pre=pre
+    ):
         return warpy.dgelu_addmm_(out, g, weight, pre)
     return out.addmm_(g, weight).mul_(_gelu_slope(pre).to(out.dtype))
 
@@ -399,7 +403,11 @@ def mx_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     blocks = x.float().view(m, n // 32, 32)
     amax = blocks.abs().amax(-1).clamp_min(2.0**-126)
     e = torch.ceil(torch.log2(amax / 448.0)).clamp(-127, 127)
-    q = (blocks * torch.exp2(-e)[..., None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    q = (
+        (blocks * torch.exp2(-e)[..., None])
+        .clamp(-448.0, 448.0)
+        .to(torch.float8_e4m3fn)
+    )
     return q.view(m, n), (e + 127).to(torch.uint8)
 
 
@@ -483,7 +491,7 @@ def fp8_gelu_addmm_(
     if _sm120_fp8(q, w, out):
         return warpy.fp8_gelu_addmm_(out, q, s, w, mx_out)
     pre = fp8_addmm_(out, q, s, w)
-    post = F.gelu(pre) # type: ignore
+    post = F.gelu(pre)  # type: ignore
     return (post, pre, *mx_quantize(post)) if mx_out else (post, pre)
 
 
@@ -516,5 +524,5 @@ def fp8_dgelu_addmm_(
     """
     if _sm120_fp8(q, w, out, pre):
         return warpy.fp8_dgelu_addmm_(out, q, s, w, pre, mx_out)
-    out = fp8_addmm_(out, q, s, w).mul_(_gelu_slope(pre).to(out.dtype)) # type: ignore
+    out = fp8_addmm_(out, q, s, w).mul_(_gelu_slope(pre).to(out.dtype))  # type: ignore
     return _with_mx(out, mx_out)

@@ -119,7 +119,9 @@ def _run(
     y = torch.empty(m, w.shape[0], dtype=dtype, device=a.device)
     if whole:
         bulk = None if sa is None else sa[:whole]
-        _launch(a[:whole], w, act, y[:whole], bulk, sb)  # the bulk runs in place, uncopied
+        _launch(
+            a[:whole], w, act, y[:whole], bulk, sb
+        )  # the bulk runs in place, uncopied
     tail = None if sa is None else _pad_scale(sa[whole:])
     y[whole:] = _launch(_pad_rows(a[whole:]), w, act, None, tail, sb)[: m - whole]
     return y
@@ -419,7 +421,10 @@ def fits_accum_fp8(
         fits(q, w.q)
         and q.shape[0] % _BM == 0
         and out.dtype in _DTYPES
-        and all(t is None or (t.dtype == out.dtype and t.is_contiguous()) for t in (out, pre))
+        and all(
+            t is None or (t.dtype == out.dtype and t.is_contiguous())
+            for t in (out, pre)
+        )
     )
 
 
@@ -430,7 +435,15 @@ def _fp8_call(
     scales = {"a_scale_mx": s} if s.dtype == torch.uint8 else {"scale_a": s.reshape(-1)}
     tuned = _tuned_config(_key(q, w.q, act)) if act != "dgelu" else {}
     return _wk.gemm(  # type: ignore
-        q, w.q.detach(), out=out, scale_b=w.s.detach(), act=act, accum=True, **scales, **kw, **tuned
+        q,
+        w.q.detach(),
+        out=out,
+        scale_b=w.s.detach(),
+        act=act,
+        accum=True,
+        **scales,
+        **kw,
+        **tuned,
     )
 
 
@@ -501,7 +514,9 @@ def fp8_dgelu_addmm_(
     Returns:
         ``out``, or ``(out, q8, s8)`` with ``mx_out``.
     """
-    return _fp8_call(out, q, s, w, "dgelu", pre=pre.detach().contiguous(), out_mx=mx_out)
+    return _fp8_call(
+        out, q, s, w, "dgelu", pre=pre.detach().contiguous(), out_mx=mx_out
+    )
 
 
 def fp8_gemm(q: torch.Tensor, w: FP8Weight) -> torch.Tensor:

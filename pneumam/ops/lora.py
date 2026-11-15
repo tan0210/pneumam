@@ -1,3 +1,5 @@
+from typing import cast
+
 import torch
 
 from .gemm import (
@@ -120,7 +122,7 @@ def _lora_linear(
     if wq is None or ws is None:
         return addmm_(update, x, weight), low
     q, s = rowquant(x[None])
-    return fp8_addmm_(update, q[0], s, FP8Weight(wq, ws)), low
+    return cast(torch.Tensor, fp8_addmm_(update, q[0], s, FP8Weight(wq, ws))), low
 
 
 @_lora_linear.register_fake
@@ -247,29 +249,31 @@ def _lora_mlp(
     low1 = x @ a1.T
     update1 = low1 @ torch.block_diag(*bs1.unbind(0)).T
     up8, down8 = _w8(wq1, ws1), _w8(wq2, ws2)
-    hq = hs = None
+    mx: tuple[torch.Tensor, ...] = ()
     if up8 is None:
         post, pre = gelu_addmm_(update1, x, w1)
     else:
         q, s = rowquant(x[None])
         # with both layers in FP8 the GELU output goes to the second one as MXFP8
-        post, pre, *mx = fp8_gelu_addmm_(update1, q[0], s, up8, down8 is not None)
-        if mx:
-            hq, hs = mx
+        res = fp8_gelu_addmm_(update1, q[0], s, up8, down8 is not None)
+        post, pre, *rest = cast(tuple[torch.Tensor, ...], res)
+        mx = tuple(rest)
     low2 = post @ a2.T
     update2 = low2 @ torch.block_diag(*bs2.unbind(0)).T
     if down8 is None:
         out = addmm_(update2, post, w2)
     else:
-        if hq is None:
+        if not mx:
             q, s = rowquant(post[None])
-            hq, hs = q[0], s
-        out = fp8_addmm_(update2, hq, hs, down8)
+            mx = (q[0], s)
+        out = cast(torch.Tensor, fp8_addmm_(update2, mx[0], mx[1], down8))
     return out, low1, low2, pre, post
 
 
 @_lora_mlp.register_fake
-def _(x, w1, A1, B1, a1, bs1, scale1, wq1, ws1, tq1, ts1, w2, A2, B2, a2, bs2, scale2, *_):
+def _(
+    x, w1, A1, B1, a1, bs1, scale1, wq1, ws1, tq1, ts1, w2, A2, B2, a2, bs2, scale2, *_
+):
     n, h = x.shape[0], w1.shape[0]
     return (
         x.new_empty(n, w2.shape[0]),
@@ -290,7 +294,9 @@ def _setup_lora_mlp(ctx, inputs, output):
 
 
 def _bwd_lora_mlp(ctx, g, *unused):
-    x, w1, a1, bs1, w2, a2, bs2, tq1, ts1, tq2, ts2, low1, low2, pre, post = ctx.saved_tensors
+    x, w1, a1, bs1, w2, a2, bs2, tq1, ts1, tq2, ts2, low1, low2, pre, post = (
+        ctx.saved_tensors
+    )
     need = ctx.needs_input_grad
     g = g.contiguous()
     dlow2 = g @ torch.block_diag(*bs2.unbind(0))
@@ -298,7 +304,7 @@ def _bwd_lora_mlp(ctx, g, *unused):
     dB2 = _slices(g, low2, bs2, ctx.scales[1], ctx.dtypes[3]) if need[13] else None
     # one step goes back through the second layer and the GELU, adapter included
     down8, up8 = _w8(tq2, ts2), _w8(tq1, ts1)
-    dq = ds = None
+    dmx: tuple[torch.Tensor, ...] = ()
     if down8 is None:
         dpre = dgelu_addmm_(dlow2 @ a2, g, w2, pre)
     else:
@@ -306,7 +312,11 @@ def _bwd_lora_mlp(ctx, g, *unused):
         mx = need[0] and up8 is not None
         # with both backward products in FP8 the gradient goes to the first layer as MXFP8
         res = fp8_dgelu_addmm_(dlow2 @ a2, gq[0], gs, down8, pre, mx)
-        dpre, dq, ds = res if mx else (res, None, None)
+        if mx:
+            dpre, *rest = cast(tuple[torch.Tensor, ...], res)
+            dmx = tuple(rest)
+        else:
+            dpre = cast(torch.Tensor, res)
     dlow1 = dpre @ torch.block_diag(*bs1.unbind(0))
     dA1 = (dlow1.T @ x).to(ctx.dtypes[0]) if need[2] else None
     dB1 = _slices(dpre, low1, bs1, ctx.scales[0], ctx.dtypes[1]) if need[3] else None
@@ -315,11 +325,11 @@ def _bwd_lora_mlp(ctx, g, *unused):
         if up8 is None:
             dx = addmm_(dlow1 @ a1, dpre, w1, True)
         else:
-            if dq is None:
+            if not dmx:
                 q, s = rowquant(dpre[None])
-                dq, ds = q[0], s
-            dx = fp8_addmm_(dlow1 @ a1, dq, ds, up8)
-    grads = [None] * 21
+                dmx = (q[0], s)
+            dx = cast(torch.Tensor, fp8_addmm_(dlow1 @ a1, dmx[0], dmx[1], up8))
+    grads: list[torch.Tensor | None] = [None] * 21
     grads[0], grads[2], grads[3], grads[12], grads[13] = dx, dA1, dB1, dA2, dB2
     return tuple(grads)
 

@@ -4,10 +4,12 @@ import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from ...adapters.lllite import LLLiteLinear
 from ...ops import attention as A
 from ...ops import gemm
 from ...ops.adaln import adaln, adaln_fp8, residual_adaln, residual_adaln_fp8
 from ...ops.gemm import (
+    FP8Weight,
     fp8_linear,
     fp8_linear_unscaled,
     fp8_supported,
@@ -25,11 +27,23 @@ from ..spec import Prepared
 from .dit import FP8_LAYERS, AnimaDiT, Context
 
 
+def _plain(layer: nn.Module) -> bool:
+    # LLLite over a plain projection has an FP8 path of its own
+    if isinstance(layer, LLLiteLinear):
+        layer = layer.base
+    return type(layer) is nn.Linear
+
+
 def _adapted(model: AnimaDiT) -> bool:
-    # an adapter replaces a projection with a wrapper module
-    return any(
-        type(getattr(b, n)) is not nn.Linear for b in model.blocks for n in FP8_LAYERS
-    )
+    return not all(_plain(getattr(b, n)) for b in model.blocks for n in FP8_LAYERS)
+
+
+def _fp8_proj(
+    layer: Any, q: torch.Tensor, s: torch.Tensor, w: FP8Weight, fast: bool
+) -> torch.Tensor:
+    if isinstance(layer, LLLiteLinear):
+        return layer.fast_fp8(q, s, w)
+    return fp8_linear(q, s, w, fast)
 
 
 def _attention_scales(model: AnimaDiT) -> list[dict[str, float]]:
@@ -287,7 +301,7 @@ def forward_fp8(
     y = z
     for l, b in enumerate(model.blocks):
         w, s = rt.fp8[l], rt.fp8_scales[l]
-        qkv = fp8_linear(hq, hs, w["qkv"], fast)
+        qkv = _fp8_proj(b.qkv, hq, hs, w["qkv"], fast)
         rope = (b.q_norm, b.k_norm, cos, sin, c.heads)
         if quantized:
             q, k, v = qkv_norm_rope_fp8(qkv, *rope, s["q"], s["k"], 1.0, c.qk_eps)  # type: ignore
@@ -298,7 +312,7 @@ def forward_fp8(
         hq, hs, z = residual_adaln_fp8(
             o, z, mod[l, 0, 2], mod[l, 1, 0], mod[l, 1, 1], x_scales=sc
         )
-        xq = fp8_linear(hq, hs, w["xq"], fast)
+        xq = _fp8_proj(b.xq, hq, hs, w["xq"], fast)
         if quantized:
             q = head_norm_fp8(xq, b.xq_norm, c.heads, s["xq"], c.qk_eps)  # type: ignore
             att = ctx.attend_quantized(l, q, s["xq"])
@@ -308,8 +322,11 @@ def forward_fp8(
         hq, hs, z = residual_adaln_fp8(
             o, z, mod[l, 1, 2], mod[l, 2, 0], mod[l, 2, 1], x_scales=sc
         )
-        up, sc = fp8_linear_unscaled(hq, hs, w["up"], fast)
-        gq, gs = rowquant(up, gelu=True, scales=sc)
+        if isinstance(b.up, LLLiteLinear):
+            gq, gs = rowquant(b.up.fast_fp8(hq, hs, w["up"]), gelu=True)
+        else:
+            up, sc = fp8_linear_unscaled(hq, hs, w["up"], fast)
+            gq, gs = rowquant(up, gelu=True, scales=sc)
         if l + 1 < c.layers:
             y, sc = fp8_linear_unscaled(gq, gs, w["down"], fast)
             hq, hs, z = residual_adaln_fp8(

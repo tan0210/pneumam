@@ -2,6 +2,17 @@ from collections.abc import Callable, Sequence
 
 import torch
 
+_POOL = None
+
+
+def _pool():
+    # one pool for every replayed function, so freeing one graph cannot free memory another
+    # graph was captured with
+    global _POOL
+    if _POOL is None:
+        _POOL = torch.cuda.graph_pool_handle()
+    return _POOL
+
 
 class Graphed:
     """A function of tensors captured as a CUDA graph and replayed with new inputs.
@@ -34,7 +45,7 @@ class Graphed:
         torch.cuda.current_stream().wait_stream(side)
         torch.cuda.synchronize()
         self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
+        with torch.cuda.graph(self.graph, pool=_pool()):
             self.out = fn(*args)
 
     def rebind(self, *fixed: torch.Tensor) -> None:

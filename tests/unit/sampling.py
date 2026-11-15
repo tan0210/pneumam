@@ -1,3 +1,5 @@
+from typing import Any
+
 import pytest
 import torch
 from helpers import padded_text, rel, tiny_model
@@ -50,7 +52,7 @@ def test_er_sde_ode_limit_stays_close_to_euler(setup):
     m, cond, unc, x = setup
     rt = Runtime()
     want = sample(m, rt, cond, unc, x, STEPS, SCALE)
-    kw = {"sampler": "er_sde", "noise_scale": "ode"}
+    kw: dict[str, Any] = {"sampler": "er_sde", "noise_scale": "ode"}
     assert (
         rel(sample(m, rt, cond, unc, x, STEPS, SCALE, max_stage=1, **kw), want) < 1e-2
     )
@@ -61,7 +63,7 @@ def test_er_sde_ode_limit_stays_close_to_euler(setup):
 def test_er_sde_seeds_make_samples_repeatable_and_batch_independent(setup):
     m, cond, unc, x = setup
     rt = Runtime()
-    kw = {"sampler": "er_sde"}
+    kw: dict[str, Any] = {"sampler": "er_sde"}
     a = sample(m, rt, cond, unc, x, STEPS, SCALE, seeds=[1, 2], **kw)
     assert torch.equal(a, sample(m, rt, cond, unc, x, STEPS, SCALE, seeds=[1, 2], **kw))
     c = sample(m, rt, cond[:1], unc[:1], x[:1], STEPS, SCALE, seeds=[1], **kw)

@@ -471,3 +471,47 @@ def ctx_scale(
     """
     gain = torch.sigmoid(lse.float() - ln_pad.float()[:, None, None])
     return (out.float() * gain.transpose(1, 2)[..., None]).to(out.dtype)
+
+
+def lllite_hidden(
+    z: torch.Tensor,
+    down_bias: torch.Tensor,
+    mid: torch.Tensor,
+    cond_mid: torch.Tensor,
+    gamma: torch.Tensor,
+    beta: torch.Tensor,
+    strength: torch.Tensor,
+    tokens: int,
+    width: int,
+) -> torch.Tensor:
+    """Compute the hidden states of a projection's LLLite adapters, ready for the up product.
+
+    See ``pneumam.ops.lllite.lllite_hidden``.
+
+    Args:
+        z: Down products without bias, shape ``[M, >= J * m]``.
+        down_bias: Down biases, shape ``[J * m]``.
+        mid: Hidden-to-hidden part of each ``mid`` weight, shape ``[J, m, m]``.
+        cond_mid: Control part of ``mid`` with its bias, float32 ``[BC * tokens, J * m]``.
+        gamma: FiLM scales, shaped like ``cond_mid``.
+        beta: FiLM shifts, shaped like ``cond_mid``.
+        strength: One-element float32 tensor.
+        tokens: Tokens per image.
+        width: Columns of the result.
+
+    Returns:
+        ``[M, width]`` in the dtype of ``z``.
+    """
+    J, m = mid.shape[0], mid.shape[1]
+    M = z.shape[0]
+    rows = torch.arange(M, device=z.device)
+    crow = ((rows // tokens) % (cond_mid.shape[0] // tokens)) * tokens + rows % tokens
+    h = F.silu(z[:, : J * m].float() + down_bias.float())
+    u = torch.einsum("rjk,jnk->rjn", h.view(M, J, m), mid.float()).reshape(M, J * m)
+    v = u + cond_mid.float()[crow]
+    v = v * (1 + gamma.float()[crow]) + beta.float()[crow]
+    s = strength.float()
+    out = torch.zeros(M, width, dtype=torch.float32, device=z.device)
+    out[:, : J * m] = F.silu(v) * s
+    out[:, J * m] = s
+    return out.to(z.dtype)

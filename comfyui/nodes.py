@@ -1,3 +1,6 @@
+# pyright: reportMissingImports=false
+from typing import cast
+
 import comfy.model_management as mm
 import comfy.model_patcher
 import comfy.sample
@@ -7,13 +10,14 @@ import torch.nn.functional as F
 
 from pneumam import models
 from pneumam.models.anima import fused
+from pneumam.models.anima.dit import AnimaDiT
 from pneumam.models.anima.text import TextEncoder
 from pneumam.models.vae import load_decoder
 from pneumam.models.vae.latents import from_bchw, normalize, to_bchw
 from pneumam.runtime import Runtime
 from pneumam.sampling.loop import SAMPLERS, sample
 
-from .model import LORAS, Denoiser, PneumamConfig, PneumamModel
+from .model import LLLITE, LORAS, Denoiser, PneumamConfig, PneumamModel
 
 CATEGORY = "Pneumam"
 DTYPE = torch.bfloat16
@@ -41,7 +45,7 @@ class LoadModel:
     def load(self, checkpoint: str, fp8: bool, cuda_graphs: bool):
         device = mm.get_torch_device()
         path = folder_paths.get_full_path_or_raise("diffusion_models", checkpoint)
-        dit = models.load(path, device, DTYPE)
+        dit = cast(AnimaDiT, models.load(path, device, DTYPE))
         rt = Runtime()
         if fp8:
             fused.enable_fp8(dit, rt)
@@ -94,7 +98,9 @@ class TextEncode:
     def encode(self, text: str, encoder: TextEncoder, length: int):
         ctx = encoder.encode(text, DTYPE)
         if ctx.shape[1] > length:
-            raise ValueError(f"the prompt has {ctx.shape[1]} tokens, more than {length}")
+            raise ValueError(
+                f"the prompt has {ctx.shape[1]} tokens, more than {length}"
+            )
         # one padded length lets the positive and negative prompts share a batch
         ctx = F.pad(ctx, (0, 0, 0, length - ctx.shape[1]))
         return ([[ctx, {}]],)
@@ -167,20 +173,39 @@ class Sampler:
                 "latent_image": ("LATENT",),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
                 "steps": ("INT", {"default": 30, "min": 1, "max": 1000}),
-                "cfg": ("FLOAT", {"default": 4.0, "min": 0.0, "max": 100.0, "step": 0.1}),
+                "cfg": (
+                    "FLOAT",
+                    {"default": 4.0, "min": 0.0, "max": 100.0, "step": 0.1},
+                ),
                 "sampler": (list(SAMPLERS),),
-                "shift": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 100.0, "step": 0.1}),
+                "shift": (
+                    "FLOAT",
+                    {"default": 3.0, "min": 0.0, "max": 100.0, "step": 0.1},
+                ),
                 "cuda_graphs": ("BOOLEAN", {"default": True}),
             }
         }
 
-    def sample(self, model, positive, negative, latent_image, seed, steps, cfg, sampler, shift, cuda_graphs):
+    def sample(
+        self,
+        model,
+        positive,
+        negative,
+        latent_image,
+        seed,
+        steps,
+        cfg,
+        sampler,
+        shift,
+        cuda_graphs,
+    ):
         denoiser = model.model.diffusion_model
         if not isinstance(denoiser, Denoiser):
-            raise ValueError("Pneumam KSampler needs a model from Load Pneumam Model")
+            raise TypeError("Pneumam KSampler needs a model from Load Pneumam Model")
         mm.load_models_gpu([model])
-        denoiser.sync(model.model_options.get("transformer_options", {}).get(LORAS, ()))
         z = comfy.sample.fix_empty_latent_channels(model, latent_image["samples"])
+        options = model.model_options.get("transformer_options", {})
+        denoiser.sync(options, z.shape[-2], z.shape[-1])
         noise = comfy.sample.prepare_noise(z, seed, latent_image.get("batch_index"))
         frames = noise.dim() == 5
         device = mm.get_torch_device()
@@ -204,6 +229,7 @@ class Sampler:
             sampler=sampler,
             seeds=[seed + i for i in range(batch)],
             graph=cuda_graphs,
+            before_step=lambda i, sigma: denoiser.gate(sigma),
         )
         # Wan21's statistics are shaped for [B, C, T, H, W], so convert in that layout
         raw = model.model.process_latent_out(to_bchw(out, layout).float()[:, :, None])
@@ -228,13 +254,16 @@ class LoRA:
             "required": {
                 "model": ("MODEL",),
                 "lora": (folder_paths.get_filename_list("loras"),),
-                "strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
+                "strength": (
+                    "FLOAT",
+                    {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01},
+                ),
             }
         }
 
     def apply(self, model, lora: str, strength: float):
         if not isinstance(model.model.diffusion_model, Denoiser):
-            raise ValueError("Pneumam LoRA needs a model from Load Pneumam Model")
+            raise TypeError("Pneumam LoRA needs a model from Load Pneumam Model")
         path = folder_paths.get_full_path_or_raise("loras", lora)
         out = model.clone()
         opts = dict(out.model_options.get("transformer_options", {}))
@@ -243,7 +272,62 @@ class LoRA:
         return (out,)
 
 
+class LLLiteApply:
+    """Add ControlNet-LLLite control to a Pneumam model.
+
+    Reads Anima LLLite files from kohya's sd-scripts. Inpainting models also take a mask, where
+    white marks the area to generate.
+    """
+
+    CATEGORY = CATEGORY
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "lllite": (folder_paths.get_filename_list("model_patches"),),
+                "image": ("IMAGE",),
+                "strength": (
+                    "FLOAT",
+                    {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01},
+                ),
+                "start_percent": (
+                    "FLOAT",
+                    {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001},
+                ),
+                "end_percent": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001},
+                ),
+            },
+            "optional": {"mask": ("MASK",)},
+        }
+
+    def apply(
+        self, model, lllite, image, strength, start_percent, end_percent, mask=None
+    ):
+        if not isinstance(model.model.diffusion_model, Denoiser):
+            raise TypeError("Pneumam LLLite needs a model from Load Pneumam Model")
+        sampling = model.get_model_object("model_sampling")
+        out = model.clone()
+        opts = dict(out.model_options.get("transformer_options", {}))
+        opts[LLLITE] = {
+            "path": folder_paths.get_full_path_or_raise("model_patches", lllite),
+            "image": image,
+            "mask": mask,
+            "strength": strength,
+            "sigma_start": float(sampling.percent_to_sigma(start_percent)),
+            "sigma_end": float(sampling.percent_to_sigma(end_percent)),
+        }
+        out.model_options["transformer_options"] = opts
+        return (out,)
+
+
 NODE_CLASS_MAPPINGS = {
+    "PneumamLLLite": LLLiteApply,
     "PneumamLoRA": LoRA,
     "PneumamSampler": Sampler,
     "PneumamLoadModel": LoadModel,
@@ -255,6 +339,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PneumamSampler": "Pneumam KSampler",
     "PneumamLoRA": "Pneumam LoRA",
+    "PneumamLLLite": "Pneumam LLLite",
     "PneumamLoadModel": "Load Pneumam Model",
     "PneumamLoadTextEncoder": "Load Pneumam Text Encoder",
     "PneumamTextEncode": "Pneumam Text Encode",

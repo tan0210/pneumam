@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import torch
@@ -29,6 +29,7 @@ def sample(
     seeds: Sequence[int] | None = None,
     noise_scale: str = "er",
     graph: bool = False,
+    before_step: Callable[[int, float], None] | None = None,
 ) -> torch.Tensor:
     """Denoise a latent, with classifier-free guidance if negative embeddings are given.
 
@@ -52,6 +53,9 @@ def sample(
             of shapes, dtypes and guidance scale captures a graph, at the cost of about three
             extra evaluations, and later calls reuse it. Changes to the weights are not tracked,
             so clear ``rt.graphs`` after changing them.
+        before_step: Called with the step index and its noise level before each model
+            evaluation, for example to switch a control on or off. It may change inputs that
+            the model reads in place, but not their shapes.
 
     Returns:
         Denoised latent in float32, shaped like ``x``.
@@ -79,6 +83,8 @@ def sample(
         runner.rebind(*prep.fixed)
 
     def velocity(i: int, z: torch.Tensor) -> torch.Tensor:
+        if before_step is not None:
+            before_step(i, float(sg[i]))
         if runner is not None:
             return runner(z, *prep.per_step(i))
         return fn(z, *prep.per_step(i), *prep.fixed)
