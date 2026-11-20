@@ -22,6 +22,19 @@ TUNE_CACHE_PATH = os.environ.get(
 _tuned: dict[str, dict] | None = None
 
 
+def supports(feature: str, device: torch.device) -> bool:
+    """Tell whether the library has a kernel for a feature on a GPU.
+
+    Args:
+        feature: A ``warpy_kernels.supports`` feature, such as ``"gemm"`` or ``"gemm_fp8"``.
+        device: CUDA device to check.
+
+    Returns:
+        True if the library is installed and runs ``feature`` on ``device``.
+    """
+    return available and _wk.supports(feature, device)  # type: ignore
+
+
 def _weight_fits(w: torch.Tensor) -> bool:
     n, k = w.shape
     return (
@@ -48,10 +61,11 @@ def fits(x: torch.Tensor, *weights: torch.Tensor) -> bool:
     )
 
 
-def _key(a: torch.Tensor, w: torch.Tensor, act: str) -> str:
+def _key(a: torch.Tensor, w: torch.Tensor, act: str, trans: bool = False) -> str:
     gpu = torch.cuda.get_device_name(a.device)
     m = max(a.shape[0] // _BM, 1) * _BM  # the rows of the main launch
-    return f"{gpu}|{a.dtype}|m={m}|n={w.shape[0]}|k={w.shape[1]}|act={act}"
+    key = f"{gpu}|{a.dtype}|m={m}|n={w.shape[0]}|k={w.shape[1]}|act={act}"
+    return f"{key}|trans" if trans else key
 
 
 def _tuned_config(key: str) -> dict:
@@ -240,8 +254,12 @@ def _mlp_bwd(
     dout, x, pre = (t.detach().contiguous() for t in (dout.to(w2.dtype), x, pre))
     w1, w2 = w1.detach(), w2.detach()
     # one kernel multiplies by the weight and by the GELU derivative at the stored input
-    dpre = _wk.gemm(dout, w2, b_trans=True, act="dgelu", pre=pre)  # type: ignore
-    dx = _wk.gemm(dpre, w1, b_trans=True) if need_dx else x.new_empty(0)  # type: ignore
+    tuned = _tuned_config(_key(dout, w2, "dgelu", True))
+    dpre = _wk.gemm(dout, w2, b_trans=True, act="dgelu", pre=pre, **tuned)  # type: ignore
+    dx = x.new_empty(0)
+    if need_dx:
+        tuned = _tuned_config(_key(dpre, w1, "", True))
+        dx = _wk.gemm(dpre, w1, b_trans=True, **tuned)  # type: ignore
     dw1 = dpre.T @ x if need_dw1 else w1.new_empty(0)  # type: ignore
     dw2 = dout.T @ torch.nn.functional.gelu(pre) if need_dw2 else w2.new_empty(0)
     return dx, dw1, dw2  # type: ignore
@@ -357,7 +375,7 @@ def addmm_(
         ``out``.
     """
     x, weight = x.detach().contiguous(), weight.detach()
-    tuned = {} if transposed else _tuned_config(_key(x, weight, ""))
+    tuned = _tuned_config(_key(x, weight, "", transposed))
     _wk.gemm(x, weight, out=out, b_trans=transposed, accum=True, **tuned)  # type: ignore
     return out
 
@@ -395,7 +413,10 @@ def dgelu_addmm_(
         ``out``.
     """
     g, weight, pre = g.detach().contiguous(), weight.detach(), pre.detach().contiguous()
-    _wk.gemm(g, weight, out=out, b_trans=True, act="dgelu", pre=pre, accum=True)  # type: ignore
+    tuned = _tuned_config(_key(g, weight, "dgelu", True))
+    _wk.gemm(  # type: ignore
+        g, weight, out=out, b_trans=True, act="dgelu", pre=pre, accum=True, **tuned
+    )
     return out
 
 
@@ -433,7 +454,7 @@ def _fp8_call(
 ):
     q, s = q.detach().contiguous(), s.detach().contiguous()
     scales = {"a_scale_mx": s} if s.dtype == torch.uint8 else {"scale_a": s.reshape(-1)}
-    tuned = _tuned_config(_key(q, w.q, act)) if act != "dgelu" else {}
+    tuned = _tuned_config(_key(q, w.q, act))
     return _wk.gemm(  # type: ignore
         q,
         w.q.detach(),
@@ -593,6 +614,51 @@ def warmup(
         _store_config(key, best)
     _run(a, weight, act)
     torch.cuda.synchronize(weight.device)
+
+
+def warmup_backward(
+    rows: int,
+    weight: torch.Tensor | FP8Weight,
+    dgelu: bool = False,
+    tune: bool = True,
+    verbose: bool = False,
+) -> None:
+    """Tune the product that carries a gradient back through a linear layer.
+
+    Results are saved with those of ``warmup``.
+
+    Args:
+        rows: Rows of the gradient: batch times tokens. Rounded down to a multiple of 128.
+        weight: The layer's ``[N, K]`` bf16 or fp16 weight, used transposed as in
+            ``addmm_(..., transposed=True)``. For FP8, ``quantize_weight(weight.T)`` of shape
+            ``[K, N]``, used as in ``fp8_addmm_``.
+        dgelu: Whether a GELU precedes the layer, so the product also applies its derivative
+            as in ``dgelu_addmm_`` and ``fp8_dgelu_addmm_``.
+        tune: Whether to tune if no saved result exists.
+        verbose: Whether to print progress while tuning.
+    """
+    fp8 = isinstance(weight, FP8Weight)
+    b = weight.q if fp8 else weight
+    m = max(rows // _BM, 1) * _BM
+    n, k = (b.shape[1], b.shape[0]) if fp8 else b.shape
+    dtype = torch.bfloat16 if fp8 else b.dtype
+    a = torch.zeros(m, n, dtype=b.dtype, device=b.device)
+    act = "dgelu" if dgelu else ""
+    key = _key(a, b, act, not fp8)
+    if not tune or _tuned_config(key):
+        return
+    out = torch.zeros(m, k, dtype=dtype, device=b.device)
+    kwargs: dict = {"out": out, "accum": True}
+    if dgelu:
+        kwargs |= {"act": "dgelu", "pre": torch.zeros_like(out)}
+    if fp8:
+        ones = torch.ones(m, dtype=torch.float32, device=b.device)
+        kwargs |= {"scale_a": ones, "scale_b": weight.s.detach()}  # type: ignore
+    else:
+        kwargs["b_trans"] = True
+    best, _ = _wk.autotune_gemm(a, b.detach(), verbose=verbose, **kwargs)  # type: ignore
+    _store_config(key, best)
+    torch.cuda.synchronize(b.device)
 
 
 def fits_attention(q: torch.Tensor) -> bool:
@@ -905,6 +971,128 @@ def attention_trimmed(
     return _attention_trimmed(q, k, v, seqused_k, rescale)
 
 
+def fits_attention_bf16(q: torch.Tensor) -> bool:
+    """Tell whether the bf16 attention kernels can run on inputs like ``q``.
+
+    Args:
+        q: Representative attention input, shape ``[B, S, H, hd]``.
+
+    Returns:
+        True if ``fits_attention`` holds and ``q`` is bf16.
+    """
+    return fits_attention(q) and q.dtype == torch.bfloat16
+
+
+def _heads_first(*tensors: torch.Tensor) -> list[torch.Tensor]:
+    return [t.detach().transpose(1, 2) for t in tensors]
+
+
+@torch.library.custom_op("pneumam::attention_bf16_warpy", mutates_args=())
+def _attention_bf16(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, need_lse: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.empty_like(q)
+    _, lse, _ = _wk.attn_fwd(  # type: ignore
+        *_heads_first(q, k, v), out=out.transpose(1, 2), return_lse=need_lse
+    )
+    return out, lse.contiguous() if need_lse else q.new_empty(0, dtype=torch.float32)
+
+
+@_attention_bf16.register_fake
+def _(q, k, v, need_lse):
+    stats = (q.shape[0], q.shape[2], q.shape[1]) if need_lse else (0,)
+    return torch.empty_like(q), q.new_empty(stats, dtype=torch.float32)
+
+
+@torch.library.custom_op("pneumam::attention_bf16_bwd_warpy", mutates_args=())
+def _attention_bf16_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    g: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    operands = [t.contiguous() for t in _heads_first(q, k, v, out)]
+    dout = g.detach().transpose(1, 2).to(torch.bfloat16).contiguous()
+    lse = lse.detach()
+    # bf16 ignores pmax but its shape is still checked
+    dq, dk, dv = _wk.attn_bwd(*operands, lse, lse, dout)  # type: ignore
+    return tuple(t.transpose(1, 2).contiguous() for t in (dq, dk, dv))  # type: ignore
+
+
+@_attention_bf16_bwd.register_fake
+def _(q, k, v, out, lse, g):
+    return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+
+
+def _attention_bf16_setup(ctx, inputs, output):
+    ctx.save_for_backward(*inputs[:3], *output)
+
+
+def _attention_bf16_backward(ctx, g, *unused):
+    q, k, v, out, lse = ctx.saved_tensors
+    return (*_attention_bf16_bwd(q, k, v, out, lse, g), None)
+
+
+_attention_bf16.register_autograd(
+    _attention_bf16_backward, setup_context=_attention_bf16_setup
+)
+
+
+def attention_bf16(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Full, non-causal multi-head attention in bf16. Differentiable.
+
+    Args:
+        q: Queries accepted by ``fits_attention_bf16``, shape ``[B, Sq, H, hd]``.
+        k: Keys, bf16, shape ``[B, Sk, H, hd]``.
+        v: Values, bf16, shape ``[B, Sk, H, hd]``.
+
+    Returns:
+        Attention output, bfloat16, shape ``[B, Sq, H, hd]``.
+    """
+    need_lse = torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v))
+    return _attention_bf16(q, k, v, need_lse)[0]
+
+
+@torch.library.custom_op("pneumam::attention_trimmed_bf16_warpy", mutates_args=())
+def _attention_trimmed_bf16(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seqused_k: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.empty_like(q)
+    _, lse, _ = _wk.attn_fwd(  # type: ignore
+        *_heads_first(q, k, v),
+        out=out.transpose(1, 2),
+        seqused_k=seqused_k,
+        lse_natural=True,
+    )
+    return out, lse.contiguous()
+
+
+@_attention_trimmed_bf16.register_fake
+def _(q, k, v, seqused_k):
+    stats = (q.shape[0], q.shape[2], q.shape[1])
+    return torch.empty_like(q), q.new_empty(stats, dtype=torch.float32)
+
+
+def attention_trimmed_bf16(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seqused_k: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """bf16 attention over the first ``seqused_k[b]`` keys of each batch item. Forward only.
+
+    Args:
+        q: Queries accepted by ``fits_attention_bf16``, shape ``[B, Sq, H, hd]``.
+        k: Keys, bf16, shape ``[B, Sk, H, hd]``.
+        v: Values, bf16, shape ``[B, Sk, H, hd]``.
+        seqused_k: Valid key count per batch item, int32, shape ``[B]``.
+
+    Returns:
+        ``(out, lse)``: the bfloat16 output ``[B, Sq, H, hd]`` and the float32 natural-log softmax
+        normalizer ``[B, H, Sq]``. See ``ctx_scale``.
+    """
+    return _attention_trimmed_bf16(q, k, v, seqused_k)
+
+
 def warmup_attention(
     batch: int,
     heads: int,
@@ -915,6 +1103,8 @@ def warmup_attention(
     trimmed: bool = False,
     tune: bool = True,
     verbose: bool = False,
+    bf16: bool = False,
+    backward: bool = False,
 ) -> None:
     """Prepare one attention shape so that later calls with it start fast.
 
@@ -931,13 +1121,38 @@ def warmup_attention(
         trimmed: Whether to prepare ``attention_trimmed`` instead of ``attention``.
         tune: Whether to tune the shape if no saved result exists for it.
         verbose: Whether to print progress while tuning.
+        bf16: Whether to prepare the bf16 kernels instead of the FP8 ones.
+        backward: Whether to also tune the backward kernel, for training. Ignored with
+            ``trimmed``, which has no backward.
     """
-    q = torch.zeros(batch, q_len, heads, head_dim, dtype=torch.uint8, device=device)
-    k = torch.zeros(batch, k_len, heads, head_dim, dtype=torch.uint8, device=device)
-    key = _wk.utils.tune_key("fwd", head_dim, False, q_len, k_len, 1)  # type: ignore
+    dtype = torch.bfloat16 if bf16 else FP8
+    q = torch.zeros(batch, q_len, heads, head_dim, dtype=dtype, device=device)
+    k = torch.zeros(batch, k_len, heads, head_dim, dtype=dtype, device=device)
+    arch = _wk.device_arch(q)  # type: ignore
+    kind = "fwd_bf16" if bf16 else "fwd"
+    key = _wk.utils.tune_key(kind, head_dim, False, q_len, k_len, 1, arch)  # type: ignore
     if tune and not _wk.utils.tune_lookup(key):  # type: ignore
-        q8, k8 = q.view(FP8).transpose(1, 2), k.view(FP8).transpose(1, 2)
-        _wk.attn.autotune_attn_fwd(q8, k8, k8, verbose=verbose)  # type: ignore
+        qh, kh = q.transpose(1, 2), k.transpose(1, 2)
+        _wk.attn.autotune_attn_fwd(qh, kh, kh, verbose=verbose)  # type: ignore
     used = torch.full((batch,), k_len, dtype=torch.int32, device=device)
-    _attend(q.view(FP8), k.view(FP8), k.view(FP8), False, used if trimmed else None)
+    if bf16:
+        if trimmed:
+            attention_trimmed_bf16(q, k, k, used)
+        else:
+            _attention_bf16(q, k, k, False)
+    else:
+        _attend(q, k, k, False, used if trimmed else None)
+    if backward and tune and not trimmed:
+        _tune_attention_backward(q, k, arch, verbose)
     torch.cuda.synchronize(device)
+
+
+def _tune_attention_backward(q, k, arch, verbose):
+    kind = "bwd_bf16" if q.dtype == torch.bfloat16 else "bwd"
+    key = _wk.utils.tune_key(kind, q.shape[-1], False, q.shape[1], k.shape[1], 1, arch)  # type: ignore
+    if _wk.utils.tune_lookup(key):  # type: ignore
+        return
+    qh, kh = q.transpose(1, 2).contiguous(), k.transpose(1, 2).contiguous()
+    out, lse, pmax = _wk.attn_fwd(qh, kh, kh, return_lse=True)  # type: ignore
+    dout = torch.zeros_like(out)
+    _wk.attn.autotune_attn_bwd(qh, kh, kh, out, lse, pmax, dout, verbose=verbose)  # type: ignore

@@ -17,7 +17,7 @@ from pneumam.models.vae.latents import from_bchw, normalize, to_bchw
 from pneumam.runtime import Runtime
 from pneumam.sampling.loop import SAMPLERS, sample
 
-from .model import LLLITE, LORAS, Denoiser, PneumamConfig, PneumamModel
+from .model import LLLITE, LORAS, Denoiser, PneumamConfig, PneumamModel, file_stamp
 
 CATEGORY = "Pneumam"
 DTYPE = torch.bfloat16
@@ -223,7 +223,7 @@ class Sampler:
             sampler=sampler,
             seeds=[seed + i for i in range(batch)],
             graph=cuda_graphs,
-            before_step=lambda i, sigma: denoiser.gate(sigma),
+            before_step=lambda i, sigma: denoiser.gate(sigma, shift),
         )
         # Wan21's statistics are shaped for [B, C, T, H, W], so convert in that layout
         raw = model.model.process_latent_out(to_bchw(out, layout).float()[:, :, None])
@@ -255,13 +255,17 @@ class LoRA:
             }
         }
 
+    @classmethod
+    def IS_CHANGED(cls, lora: str, **kwargs):
+        return str(file_stamp(folder_paths.get_full_path_or_raise("loras", lora)))
+
     def apply(self, model, lora: str, strength: float):
         if not isinstance(model.model.diffusion_model, Denoiser):
             raise TypeError("Pneumam LoRA needs a model from Load Pneumam Model")
         path = folder_paths.get_full_path_or_raise("loras", lora)
         out = model.clone()
         opts = dict(out.model_options.get("transformer_options", {}))
-        opts[LORAS] = tuple(opts.get(LORAS, ())) + ((path, strength),)
+        opts[LORAS] = tuple(opts.get(LORAS, ())) + ((path, strength, file_stamp(path)),)
         out.model_options["transformer_options"] = opts
         return (out,)
 
@@ -300,6 +304,12 @@ class LLLiteApply:
             "optional": {"mask": ("MASK",)},
         }
 
+    @classmethod
+    def IS_CHANGED(cls, lllite: str, **kwargs):
+        return str(
+            file_stamp(folder_paths.get_full_path_or_raise("model_patches", lllite))
+        )
+
     def apply(
         self, model, lllite, image, strength, start_percent, end_percent, mask=None
     ):
@@ -308,11 +318,15 @@ class LLLiteApply:
         sampling = model.get_model_object("model_sampling")
         out = model.clone()
         opts = dict(out.model_options.get("transformer_options", {}))
+        path = folder_paths.get_full_path_or_raise("model_patches", lllite)
         opts[LLLITE] = {
-            "path": folder_paths.get_full_path_or_raise("model_patches", lllite),
+            "path": path,
+            "stamp": file_stamp(path),
             "image": image,
             "mask": mask,
             "strength": strength,
+            "start_percent": start_percent,
+            "end_percent": end_percent,
             "sigma_start": float(sampling.percent_to_sigma(start_percent)),
             "sigma_end": float(sampling.percent_to_sigma(end_percent)),
         }

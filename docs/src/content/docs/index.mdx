@@ -1,0 +1,25 @@
+---
+title: Pneumam docs
+description: Install Pneumam, convert the Anima model, and generate from ComfyUI, the command line or Python.
+template: splash
+hero:
+  tagline: Faster Anima image generation, 3.3 seconds an image on an RTX 5090.
+  actions:
+    - text: Install Pneumam
+      link: /start/install/
+      icon: right-arrow
+    - text: ComfyUI nodes
+      link: /comfyui/nodes/
+      variant: minimal
+---
+
+import { CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+<CardGrid>
+	<LinkCard title="Install" href="/start/install/" description="The uv command and the extras for your GPU." />
+	<LinkCard title="Convert checkpoints" href="/start/convert/" description="Turn the Diffusers release into Pneumam's files, once." />
+	<LinkCard title="ComfyUI nodes" href="/comfyui/nodes/" description="Set up, the eight nodes and a minimal graph." />
+	<LinkCard title="ComfyUI on a rented GPU" href="/comfyui/remote/" description="Run the server remotely and open it in your browser." />
+	<LinkCard title="Python pipeline" href="/generate/python/" description="Load the model and generate from a script." />
+	<LinkCard title="Training" href="/adapters/training/" description="Train LoRA and LLLite adapters on one GPU or several." />
+</CardGrid>

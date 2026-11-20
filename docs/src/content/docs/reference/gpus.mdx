@@ -1,0 +1,50 @@
+---
+title: Supported GPUs
+description: The GPUs Pneumam runs on, and the extra each one needs.
+sidebar:
+  order: 1
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Pneumam detects your GPU and sets itself up for it, so there is nothing to configure.
+
+| GPU | Support | Extra |
+|---|---|---|
+| RTX 5080, RTX 5090 and other RTX 50 series cards | Pneumam is fastest on these cards. | `sm120` |
+| RTX PRO 6000 Blackwell | It is supported. | `sm120` |
+| H100 and H200 | They are supported on Linux. | `sm90` |
+| RTX 4090 and other RTX 40 series cards, L4, L40 | They are supported, FP8 included. | `sm89` |
+| RTX 3090 and other RTX 30 series cards, A10, A40 | They are supported, without FP8. | `sm86` |
+| A100 and older cards | They are not supported. | |
+
+:::note
+Pneumam works best on an RTX 50 series card.
+:::
+
+## Check your setup
+
+`scripts/profile_gpu.py` checks that Pneumam gives correct results on your GPU and then measures its speed.
+
+<Tabs syncKey="os">
+<TabItem label="Linux">
+
+```bash
+python scripts/profile_gpu.py \
+  --checkpoint checkpoints/anima.safetensors \
+  --vae checkpoints/wan21-vae.safetensors
+```
+
+</TabItem>
+<TabItem label="Windows">
+
+```powershell
+python scripts\profile_gpu.py `
+  --checkpoint checkpoints\anima.safetensors `
+  --vae checkpoints\wan21-vae.safetensors
+```
+
+</TabItem>
+</Tabs>
+
+It measures 1024×1024 and 832×1216 by default. Use `--sizes` to choose others, `--steps` to change the step count from 20, and `--out` to choose the output folder, which defaults to `profile_out`. With the `bench` extra installed, it also plots the results.

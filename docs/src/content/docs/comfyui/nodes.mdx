@@ -1,0 +1,92 @@
+---
+title: ComfyUI nodes
+description: Run Anima in ComfyUI with Pneumam.
+sidebar:
+  order: 1
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+import SpeedChart from '../../../components/SpeedChart.astro';
+import NodeGraph from '../../../components/NodeGraph.astro';
+
+The Pneumam nodes run the Anima model in ComfyUI about twice as fast as ComfyUI's own Anima support, and they make the same images.
+
+<SpeedChart
+	caption="Seconds per image on an RTX 5090, at 1024×1024 with 30 Euler steps and guidance 4"
+	rows={[
+		{ label: "ComfyUI's Anima, bf16", seconds: 6.2 },
+		{ label: 'Pneumam, bf16', seconds: 5.8 },
+		{ label: 'Pneumam, FP8', seconds: 3.3, highlight: true },
+		{ label: 'Pneumam, FP8 with LLLite', seconds: 3.4, highlight: true },
+	]}
+/>
+
+## Set up
+
+1. Install Pneumam with the ComfyUI extras into the Python environment that runs ComfyUI.
+
+   ```bash
+   uv sync --extra comfyui --extra sm120   # RTX 50 series or RTX PRO 6000 Blackwell
+   uv sync --extra comfyui --extra sm90    # H100 or H200
+   ```
+
+2. Link the `comfyui` folder into ComfyUI's `custom_nodes` folder.
+
+   <Tabs syncKey="os">
+   <TabItem label="Linux">
+
+   ```bash
+   ln -s /path/to/pneumam/comfyui /path/to/ComfyUI/custom_nodes/pneumam_nodes
+   ```
+
+   </TabItem>
+   <TabItem label="Windows">
+
+   ```powershell
+   New-Item -ItemType Junction -Path "C:\path\to\ComfyUI\custom_nodes\pneumam_nodes" -Target "C:\path\to\pneumam\comfyui"
+   ```
+
+   </TabItem>
+   </Tabs>
+
+3. Start ComfyUI with these two flags.
+
+   ```bash
+   python main.py --highvram --disable-cuda-malloc
+   ```
+
+:::caution
+ComfyUI needs `--disable-cuda-malloc` to run these nodes. Without it, generation fails with the error "Pointer argument cannot be accessed from Triton".
+:::
+
+## Add the model files
+
+[Convert the model](/start/convert/) once. Put `anima.safetensors` in `models/diffusion_models` and `wan21-vae.safetensors` in `models/vae`. LoRA files go in `models/loras`, and LLLite files such as kohya-ss/Anima-LLLite go in `models/model_patches`. If you replace a LoRA or LLLite file under the same name, for example with a newer training epoch, the next run uses the new file without restarting ComfyUI.
+
+## Build the graph
+
+<NodeGraph />
+
+The dashed node is optional. Use two Pneumam Text Encode nodes, one for the positive prompt and one for the negative prompt, and give both the same `length`. Use the `simple` scheduler and a guidance scale around 4.
+
+ComfyUI's own KSampler, samplers and CFG nodes accept the Pneumam model. Nodes made for ComfyUI's built-in Anima, such as Apply Anima LLLite and regional prompting, don't, so use the Pneumam LoRA and LLLite nodes instead.
+
+## The nodes
+
+| Node | What it does |
+|---|---|
+| Load Pneumam Model | It loads a converted checkpoint. Turn on `fp8` to make generation about twice as fast, and keep `cuda_graphs` on so later images run faster than the first. |
+| Load Pneumam Text Encoder | It loads the text encoder from Hugging Face. |
+| Pneumam Text Encode | It turns a prompt into conditioning. The default `length` is 512. |
+| Pneumam KSampler | It generates from text with `euler` or `er_sde`. It takes the same inputs as KSampler, and ComfyUI's own KSampler works just as fast. |
+| Pneumam LoRA | It adds a LoRA. Chain several to stack them. It reads LoRA files from PEFT, kohya, ComfyUI and Pneumam. |
+| Pneumam LLLite | It adds control from an image, with a strength and the share of steps it applies to. Inpainting models also take a mask, where white marks the area to generate. |
+| Load Pneumam VAE | It loads the converted decoder. |
+| Pneumam VAE Decode | It turns the sampled latents into images. |
+
+## Limits
+
+- Pneumam KSampler always starts from pure noise. For image to image, use ComfyUI's KSampler with `denoise` below 1.
+- A LoRA keeps a copy of the weights it changes in GPU memory. A LoRA that covers every layer can take as much memory as the model.
+- The first image at a new size takes a few seconds longer than the rest.

@@ -1,0 +1,31 @@
+---
+// Seconds per image as horizontal bars; the fastest setups in the accent colour.
+interface Row { label: string; seconds: number; highlight?: boolean }
+interface Props { rows: Row[]; caption: string }
+const { rows, caption } = Astro.props;
+const max = Math.max(...rows.map((r) => r.seconds));
+---
+<figure class="speed not-content">
+	<figcaption>{caption}</figcaption>
+	<div class="speed__rows" role="table" aria-label={caption}>
+		{rows.map((r) => (
+			<div class:list={['speed__row', { 'is-on': r.highlight }]} role="row">
+				<span class="speed__label" role="cell">{r.label}</span>
+				<span class="speed__value" role="cell">{r.seconds.toFixed(1)} s</span>
+				<span class="speed__track" aria-hidden="true"><i style={`--v: ${r.seconds / max}`}></i></span>
+			</div>
+		))}
+	</div>
+</figure>
+
+<style>
+	.speed { margin: 1.5rem 0; padding: 1.5rem; border: 1px solid var(--sl-color-hairline); border-radius: 8px; background: var(--sl-color-gray-6); }
+	figcaption { margin-bottom: 1.25rem; font-size: var(--sl-text-sm); color: var(--sl-color-gray-3); }
+	.speed__rows { display: grid; gap: 1.1rem; }
+	.speed__row { display: grid; grid-template-columns: 1fr auto; gap: 0.4rem 1rem; align-items: baseline; }
+	.speed__label { color: var(--sl-color-gray-2); }
+	.speed__value { font-weight: 600; color: var(--sl-color-white); font-variant-numeric: tabular-nums; }
+	.speed__track { grid-column: 1 / -1; height: 14px; border-radius: 3px; background: color-mix(in srgb, var(--sl-color-white) 7%, transparent); overflow: hidden; }
+	.speed__track i { display: block; height: 100%; width: calc(var(--v) * 100%); background: var(--sl-color-gray-4); }
+	.is-on .speed__track i { background: var(--sl-color-accent); }
+</style>

@@ -215,6 +215,7 @@ def warmup(
     context_length: int | None = None,
     tune: bool = True,
     verbose: bool = False,
+    backward: bool = False,
 ) -> int:
     """Prepare the GPU kernels for one latent size and batch size, tuning them where possible.
 
@@ -230,6 +231,8 @@ def warmup(
         context_length: Padded text length, to also prepare FP8 cross-attention.
         tune: Whether to tune kernels that have no saved result yet.
         verbose: Whether to print progress while tuning.
+        backward: Whether to also tune the backward kernels, for training. With FP8 enabled
+            this includes the FP8 backward products of ``enable_fp8_base``.
 
     Returns:
         The number of kernels prepared. 0 means this GPU needs no preparation.
@@ -243,8 +246,13 @@ def warmup(
         done += gemm.warmup(rows, getattr(b, name).weight, act, tune, verbose)
         if rt.fp8 is not None:
             done += gemm.warmup(rows, rt.fp8[0][name].q, "", tune, verbose)
+        if backward:
+            w, dgelu = getattr(b, name).weight, name == "down"
+            done += gemm.warmup_backward(rows, w, dgelu, False, tune, verbose)
+            if rt.fp8 is not None:
+                done += gemm.warmup_backward(rows, w, dgelu, True, tune, verbose)
     shape = (batch, c.heads, tokens)
-    done += A.warmup(*shape, tokens, c.head_dim, device, tune, verbose)
+    done += A.warmup(*shape, tokens, c.head_dim, device, tune, verbose, backward)
     if context_length is not None:
         done += A.warmup(*shape, context_length, c.head_dim, device, tune, verbose)
     return done

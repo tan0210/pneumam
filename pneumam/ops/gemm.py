@@ -22,12 +22,18 @@ __all__ = [
     "mlp",
     "mx_dequantize",
     "mx_quantize",
+    "mx_supported",
     "quantize_weight",
     "rowquant",
     "warmup",
+    "warmup_backward",
 ]
 
 _DATACENTER = ("sm90", "sm100")
+
+
+def _warpy(device: torch.device, feature: str) -> bool:
+    return _dispatch.arch(device).startswith("sm") and warpy.supports(feature, device)
 
 
 def _needs_grad(*tensors: torch.Tensor) -> bool:
@@ -47,7 +53,7 @@ def linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     Raises:
         RuntimeError: If ``x`` is not on a CUDA device.
     """
-    if _dispatch.arch(x.device) == "sm120" and warpy.fits(x, weight):
+    if _warpy(x.device, "gemm") and warpy.fits(x, weight):
         return warpy.gemm(x, weight)
     return F.linear(x, weight)
 
@@ -66,7 +72,11 @@ def linear_gelu(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         RuntimeError: If ``x`` is not on a CUDA device.
     """
     arch = _dispatch.arch(x.device)
-    if arch == "sm120" and warpy.fits(x, weight) and not _needs_grad(x, weight):
+    if (
+        _warpy(x.device, "gemm_gelu")
+        and warpy.fits(x, weight)
+        and not _needs_grad(x, weight)
+    ):
         return warpy.linear_gelu(x, weight)
     if arch in _DATACENTER and quack.fits(x, weight):
         return quack.linear_gelu(x, weight)
@@ -93,7 +103,7 @@ def mlp(x: torch.Tensor, w_up: torch.Tensor, w_down: torch.Tensor) -> torch.Tens
     if arch in _DATACENTER and quack.fits(x, w_up, w_down):
         return quack.mlp(x, w_up, w_down)
     grad = _needs_grad(x, w_up, w_down)
-    if arch == "sm120" and grad and warpy.fits_mlp_grad(x, w_up, w_down):
+    if grad and _warpy(x.device, "gemm_dgelu") and warpy.fits_mlp_grad(x, w_up, w_down):
         return warpy.mlp_grad(x, w_up, w_down)
     return linear(linear_gelu(x, w_up), w_down)
 
@@ -114,9 +124,25 @@ def fp8_supported(device: torch.device) -> bool:
     arch = _dispatch.arch(device)
     return (
         arch == "reference"
-        or (arch == "sm120" and warpy.available)
+        or _warpy(device, "gemm_fp8")
         or (arch in _DATACENTER and triton.available)
     )
+
+
+def mx_supported(device: torch.device) -> bool:
+    """Tell whether FP8 products take MXFP8 tokens at full speed on a device.
+
+    Args:
+        device: Device to check.
+
+    Returns:
+        True if the accumulating FP8 products have an MXFP8 kernel there, or if ops are pinned to
+        the reference path. If False they still take MXFP8, but slowly.
+
+    Raises:
+        RuntimeError: If ``device`` is not a CUDA device.
+    """
+    return _dispatch.arch(device) == "reference" or _warpy(device, "gemm_mx")
 
 
 def fp8_linear(
@@ -136,7 +162,7 @@ def fp8_linear(
     Raises:
         RuntimeError: If ``q`` is not on a CUDA device.
     """
-    if _dispatch.arch(q.device) == "sm120" and warpy.fits(q, w.q):
+    if _warpy(q.device, "gemm_fp8") and warpy.fits(q, w.q):
         return warpy.fp8_linear(q, s, w)
     y, scales = fp8_linear_unscaled(q, s, w, fast_accum)
     if scales is None:
@@ -169,7 +195,7 @@ def fp8_linear_unscaled(
         RuntimeError: If ``q`` is not on a CUDA device.
     """
     arch = _dispatch.arch(q.device)
-    if arch == "sm120" and warpy.fits(q, w.q):
+    if _warpy(q.device, "gemm_fp8") and warpy.fits(q, w.q):
         return warpy.fp8_gemm(q, w), (s, w.s)
     if arch in _DATACENTER and triton.available:
         return triton.fp8_linear(q, s, w, fast_accum), None
@@ -298,16 +324,81 @@ def warmup(
     Raises:
         RuntimeError: If ``weight`` is not on a CUDA device.
     """
-    if _dispatch.arch(weight.device) == "sm120" and warpy.fits(weight, weight):
+    feature = "gemm_fp8" if weight.dtype == torch.float8_e4m3fn else "gemm"
+    if _warpy(weight.device, feature) and warpy.fits(weight, weight):
         warpy.warmup(rows, weight, act, tune, verbose)
         return True
     return False
+
+
+def warmup_backward(
+    rows: int,
+    weight: torch.Tensor,
+    dgelu: bool = False,
+    fp8: bool = False,
+    tune: bool = True,
+    verbose: bool = False,
+) -> bool:
+    """Prepare the product that carries a gradient back through a linear layer, for training.
+
+    Args:
+        rows: Rows of the gradient: batch times tokens.
+        weight: The layer's ``[N, K]`` weight, in its training dtype.
+        dgelu: Whether a GELU precedes the layer, as before the second layer of an MLP.
+        fp8: Prepare the FP8 product of ``frozen_linear_fp8`` and FP8 adapters instead.
+        tune: Whether to tune the shape if no saved result exists for it.
+        verbose: Whether to print progress while tuning.
+
+    Returns:
+        True if a kernel was prepared, False if this GPU's products need no preparation.
+
+    Raises:
+        RuntimeError: If ``weight`` is not on a CUDA device.
+    """
+    act = "gemm_dgelu" if dgelu else "gemm_accum"
+    if fp8:
+        if not (_warpy(weight.device, "gemm_fp8") and _warpy(weight.device, act)):
+            return False
+        w8 = quantize_weight(weight.detach().T.contiguous())
+        if not warpy.fits(w8.q, w8.q):
+            return False
+        warpy.warmup_backward(rows, w8, dgelu, tune, verbose)
+        return True
+    if not _warpy(weight.device, act) or not warpy.fits(
+        weight.T, weight.T.contiguous()
+    ):
+        return False
+    warpy.warmup_backward(rows, weight, dgelu, tune, verbose)
+    return True
 
 
 def _gelu_slope(pre: torch.Tensor) -> torch.Tensor:
     h = pre.float()
     density = torch.exp(-0.5 * h * h) * 0.3989422804014327
     return 0.5 * (1 + torch.erf(h * 0.7071067811865476)) + h * density
+
+
+def _bulk(m: int) -> int:
+    whole = m // 128 * 128
+    return whole if 0 < whole < m else 0  # 0 when there is no tail to split off
+
+
+def _cat_rows(*parts: torch.Tensor) -> torch.Tensor:
+    if parts[0].dtype == torch.float8_e4m3fn:  # cat has no FP8 kernel
+        return torch.cat([t.view(torch.uint8) for t in parts]).view(parts[0].dtype)
+    return torch.cat(parts)
+
+
+def _fast_addmm(out, x, weight, transposed=False) -> bool:
+    return _warpy(x.device, "gemm_accum") and warpy.fits_accum(
+        x, weight, transposed, out=out
+    )
+
+
+def _fast_dgelu(out, g, weight, pre) -> bool:
+    return _warpy(g.device, "gemm_dgelu") and warpy.fits_accum(
+        g, weight, True, out=out, pre=pre
+    )
 
 
 def addmm_(
@@ -328,9 +419,11 @@ def addmm_(
     Raises:
         RuntimeError: If ``x`` is not on a CUDA device.
     """
-    if _dispatch.arch(x.device) == "sm120" and warpy.fits_accum(
-        x, weight, transposed, out=out
-    ):
+    if (n := _bulk(x.shape[0])) and _fast_addmm(out[:n], x[:n], weight, transposed):
+        addmm_(out[:n], x[:n], weight, transposed)
+        addmm_(out[n:], x[n:], weight, transposed)
+        return out
+    if _fast_addmm(out, x, weight, transposed):
         return warpy.addmm_(out, x, weight, transposed)
     return out.addmm_(x, weight if transposed else weight.T)
 
@@ -352,7 +445,15 @@ def gelu_addmm_(
     Raises:
         RuntimeError: If ``x`` is not on a CUDA device.
     """
-    if _dispatch.arch(x.device) == "sm120" and warpy.fits_accum(x, weight, out=out):
+    if (n := _bulk(x.shape[0])) and _fast_addmm(out[:n], x[:n], weight):
+        post, pre = gelu_addmm_(out[:n], x[:n], weight)
+        tail_post, tail_pre = gelu_addmm_(out[n:], x[n:], weight)
+        pre = _cat_rows(pre, tail_pre)  # before the tail of out is overwritten
+        if post.data_ptr() != out.data_ptr():
+            return _cat_rows(post, tail_post), pre
+        out[n:].copy_(tail_post)
+        return out, pre
+    if _fast_addmm(out, x, weight):
         return warpy.gelu_addmm_(out, x, weight)
     pre = out.addmm_(x, weight.T)
     return F.gelu(pre), pre
@@ -377,15 +478,22 @@ def dgelu_addmm_(
     Raises:
         RuntimeError: If ``g`` is not on a CUDA device.
     """
-    if _dispatch.arch(g.device) == "sm120" and warpy.fits_accum(
-        g, weight, True, out=out, pre=pre
-    ):
+    if (n := _bulk(g.shape[0])) and _fast_dgelu(out[:n], g[:n], weight, pre[:n]):
+        dgelu_addmm_(out[:n], g[:n], weight, pre[:n])
+        dgelu_addmm_(out[n:], g[n:], weight, pre[n:])
+        return out
+    if _fast_dgelu(out, g, weight, pre):
         return warpy.dgelu_addmm_(out, g, weight, pre)
     return out.addmm_(g, weight).mul_(_gelu_slope(pre).to(out.dtype))
 
 
-def _sm120_fp8(q: torch.Tensor, w: FP8Weight, out: torch.Tensor, pre=None) -> bool:
-    return _dispatch.arch(q.device) == "sm120" and warpy.fits_accum_fp8(q, w, out, pre)
+def _warpy_fp8(q, s, w: FP8Weight, out: torch.Tensor, mx_out: bool, pre=None) -> bool:
+    features = ["gemm_mx" if s.dtype == torch.uint8 else "gemm_fp8"]
+    if mx_out:
+        features.append("gemm_mx_out")
+    return all(_warpy(q.device, f) for f in features) and warpy.fits_accum_fp8(
+        q, w, out, pre
+    )
 
 
 def mx_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -430,6 +538,10 @@ def _fp8_product(q: torch.Tensor, s: torch.Tensor, w: FP8Weight) -> torch.Tensor
     return fp8_linear(q[None], s, w)[0].float()
 
 
+def _join_mx(out: torch.Tensor, bulk: tuple, tail: tuple) -> tuple:
+    return (out, *(_cat_rows(a, b) for a, b in zip(bulk[1:], tail[1:])))
+
+
 def _with_mx(out: torch.Tensor, mx_out: bool):
     return (out, *mx_quantize(out)) if mx_out else out
 
@@ -447,7 +559,7 @@ def fp8_addmm_(
         out: Contiguous bf16 or fp16 buffer, shape ``[M, N]``.
         q: FP8 tokens, shape ``[M, K]``.
         s: Float32 token scales ``[M, 1]`` from ``rowquant``, or uint8 MXFP8 scales
-            ``[M, K / 32]``. See ``mx_quantize``.
+        ``[M, K / 32]``. See ``mx_quantize``.
         w: Weight from ``quantize_weight``, shape ``[N, K]``.
         mx_out: Also return the sum as MXFP8.
 
@@ -457,7 +569,11 @@ def fp8_addmm_(
     Raises:
         RuntimeError: If ``q`` is not on a CUDA device.
     """
-    if _sm120_fp8(q, w, out):
+    if (n := _bulk(q.shape[0])) and _warpy_fp8(q[:n], s[:n], w, out[:n], mx_out):
+        bulk = fp8_addmm_(out[:n], q[:n], s[:n], w, mx_out)
+        tail = fp8_addmm_(out[n:], q[n:], s[n:], w, mx_out)
+        return _join_mx(out, bulk, tail) if mx_out else out
+    if _warpy_fp8(q, s, w, out, mx_out):
         return warpy.fp8_addmm_(out, q, s, w, mx_out)
     return _with_mx(out.add_(_fp8_product(q, s, w).to(out.dtype)), mx_out)
 
@@ -475,7 +591,7 @@ def fp8_gelu_addmm_(
 
     Args:
         out: Contiguous bf16 or fp16 buffer holding the addend, shape ``[M, N]``. It is
-            overwritten.
+        overwritten.
         q: FP8 tokens, shape ``[M, K]``.
         s: Float32 token scales ``[M, 1]``, or uint8 MXFP8 scales ``[M, K / 32]``.
         w: Weight from ``quantize_weight``, shape ``[N, K]``.
@@ -488,7 +604,19 @@ def fp8_gelu_addmm_(
     Raises:
         RuntimeError: If ``q`` is not on a CUDA device.
     """
-    if _sm120_fp8(q, w, out):
+    if (n := _bulk(q.shape[0])) and _warpy_fp8(q[:n], s[:n], w, out[:n], mx_out):
+        bulk = fp8_gelu_addmm_(out[:n], q[:n], s[:n], w, mx_out)
+        tail = fp8_gelu_addmm_(out[n:], q[n:], s[n:], w, mx_out)
+        pre = _cat_rows(bulk[1], tail[1])  # before the tail of out is overwritten
+        post = bulk[0]
+        if post.data_ptr() == out.data_ptr():
+            out[n:].copy_(tail[0])
+            post = out
+        else:
+            post = _cat_rows(bulk[0], tail[0])
+        mx = [_cat_rows(a, b) for a, b in zip(bulk[2:], tail[2:])]
+        return (post, pre, *mx)
+    if _warpy_fp8(q, s, w, out, mx_out):
         return warpy.fp8_gelu_addmm_(out, q, s, w, mx_out)
     pre = fp8_addmm_(out, q, s, w)
     post = F.gelu(pre)  # type: ignore
@@ -522,7 +650,13 @@ def fp8_dgelu_addmm_(
     Raises:
         RuntimeError: If ``q`` is not on a CUDA device.
     """
-    if _sm120_fp8(q, w, out, pre):
+    if (n := _bulk(q.shape[0])) and _warpy_fp8(
+        q[:n], s[:n], w, out[:n], mx_out, pre[:n]
+    ):
+        bulk = fp8_dgelu_addmm_(out[:n], q[:n], s[:n], w, pre[:n], mx_out)
+        tail = fp8_dgelu_addmm_(out[n:], q[n:], s[n:], w, pre[n:], mx_out)
+        return _join_mx(out, bulk, tail) if mx_out else out
+    if _warpy_fp8(q, s, w, out, mx_out, pre):
         return warpy.fp8_dgelu_addmm_(out, q, s, w, pre, mx_out)
     out = fp8_addmm_(out, q, s, w).mul_(_gelu_slope(pre).to(out.dtype))  # type: ignore
     return _with_mx(out, mx_out)

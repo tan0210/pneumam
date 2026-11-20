@@ -188,8 +188,19 @@ def test_warpy_runs_whole_blocks_in_place_and_pads_only_the_tail(rows, monkeypat
         out.copy_(torch.nn.functional.gelu(y) if act == "gelu" else y)
         return (out, None) if act == "gelu" else out
 
-    monkeypatch.setattr(warpy, "_wk", type("W", (), {"gemm": staticmethod(fake_gemm)}))
-    monkeypatch.setattr(warpy, "_key", lambda a, w, act: "k")
+    monkeypatch.setattr(
+        warpy,
+        "_wk",
+        type(
+            "W",
+            (),
+            {
+                "gemm": staticmethod(fake_gemm),
+                "supports": staticmethod(lambda f, d: True),
+            },
+        ),
+    )
+    monkeypatch.setattr(warpy, "_key", lambda *args: "k")
     a, w = (
         torch.randn(rows, 64).to(torch.bfloat16),
         torch.randn(128, 64).to(torch.bfloat16),
@@ -250,8 +261,19 @@ def test_warpy_mlp_gradients_with_a_stand_in_kernel(monkeypatch):
             return out
         return prod.to(a.dtype)
 
-    monkeypatch.setattr(warpy, "_wk", type("W", (), {"gemm": staticmethod(fake_gemm)}))
-    monkeypatch.setattr(warpy, "_key", lambda a, w, act: "k")
+    monkeypatch.setattr(
+        warpy,
+        "_wk",
+        type(
+            "W",
+            (),
+            {
+                "gemm": staticmethod(fake_gemm),
+                "supports": staticmethod(lambda f, d: True),
+            },
+        ),
+    )
+    monkeypatch.setattr(warpy, "_key", lambda *args: "k")
     monkeypatch.setattr(warpy, "available", True)
     monkeypatch.setattr(gemm._dispatch, "arch", lambda device: "sm120")
     x = torch.randn(2, 64, 64, requires_grad=True)
@@ -272,8 +294,8 @@ def test_warpy_mlp_gradients_with_a_stand_in_kernel(monkeypatch):
     assert rel(dx, want[0]) < 0.03
 
 
-def lora_mlp_case():
-    n, i, h, o, r = 128, 128, 256, 128, 4
+def lora_mlp_case(n=128):
+    i, h, o, r = 128, 256, 128, 4
     x = torch.randn(n, i, requires_grad=True)
     w1, w2 = torch.randn(h, i) * 0.2, torch.randn(o, h) * 0.2
     leaves = [
@@ -313,7 +335,8 @@ def test_lora_mlp_with_fp8_bases_stays_close_to_the_dense_formula():
     assert all(rel(a, b) < 1e-1 for a, b in zip(got, want, strict=True))
 
 
-def test_accumulating_products_with_a_stand_in_kernel(monkeypatch):
+@pytest.mark.parametrize("rows", [128, 200])
+def test_accumulating_products_with_a_stand_in_kernel(rows, monkeypatch):
     gelu = torch.nn.functional.gelu
     calls = []
 
@@ -340,11 +363,22 @@ def test_accumulating_products_with_a_stand_in_kernel(monkeypatch):
         out.copy_(prod)
         return out
 
-    monkeypatch.setattr(warpy, "_wk", type("W", (), {"gemm": staticmethod(fake_gemm)}))
-    monkeypatch.setattr(warpy, "_key", lambda a, w, act: "k")
+    monkeypatch.setattr(
+        warpy,
+        "_wk",
+        type(
+            "W",
+            (),
+            {
+                "gemm": staticmethod(fake_gemm),
+                "supports": staticmethod(lambda f, d: True),
+            },
+        ),
+    )
+    monkeypatch.setattr(warpy, "_key", lambda *args: "k")
     monkeypatch.setattr(warpy, "available", True)
     monkeypatch.setattr(gemm._dispatch, "arch", lambda device: "sm120")
-    x, up, down, dense, leaves = lora_mlp_case()
+    x, up, down, dense, leaves = lora_mlp_case(rows)
     bf = lambda t: t.to(torch.bfloat16) if isinstance(t, torch.Tensor) else t
     xb = bf(x)
     out = lora.lora_mlp(

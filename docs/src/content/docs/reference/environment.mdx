@@ -1,0 +1,44 @@
+---
+title: Environment variables
+description: The environment variables Pneumam reads.
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Set these in the shell that runs Pneumam, or in the shell that starts ComfyUI.
+
+| Variable | What it does |
+|---|---|
+| `HF_TOKEN` | It logs in to Hugging Face. Set it when the model or text encoder repository asks for a login. |
+| `PNEUMAM_TUNE_CACHE` | It sets the file where Pneumam keeps its matrix multiplication tuning results for your GPU. The default is `~/.cache/pneumam/warpy_gemm.json`. |
+| `WARPY_KERNELS_TUNE_CACHE` | It sets the file where the attention tuning results are kept. The default is `~/.cache/warpy_kernels_tune.json`. |
+| `PNEUMAM_EXPERIMENTAL_FP8_ATTENTION` | Set it to `1` to try experimental FP8 attention. It only takes effect with FP8 turned on. It is faster, but images may show odd artifacts. |
+
+## Set them before a run
+
+<Tabs syncKey="os">
+<TabItem label="Linux">
+
+```bash
+export HF_TOKEN=hf_...
+export PNEUMAM_EXPERIMENTAL_FP8_ATTENTION=1
+python main.py --highvram --disable-cuda-malloc
+```
+
+</TabItem>
+<TabItem label="Windows">
+
+```powershell
+$env:HF_TOKEN = "hf_..."
+$env:PNEUMAM_EXPERIMENTAL_FP8_ATTENTION = "1"
+python main.py --highvram --disable-cuda-malloc
+```
+
+</TabItem>
+</Tabs>
+
+:::caution
+Revoke a Hugging Face token you set on a shared or rented machine once you are done with it.
+:::

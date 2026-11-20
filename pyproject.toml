@@ -23,6 +23,14 @@ sm90 = [
     "quack-kernels[cu13]",
     "flash-attn-4>=4.0.0b38; sys_platform == 'linux'",
 ]
+sm86 = [
+    "pneumam[triton]",
+    "warpy-kernels",
+]
+sm89 = [
+    "pneumam[triton]",
+    "warpy-kernels",
+]
 sm120 = [
     "pneumam[triton]",
     "warpy-kernels",

@@ -24,8 +24,21 @@ def _flash(q: torch.Tensor) -> bool:
     return _dispatch.arch(q.device).startswith("sm") and flash_attn.fits(q)
 
 
-def _warpy(q: torch.Tensor) -> bool:
-    return _dispatch.arch(q.device) == "sm120" and warpy.fits_attention(q)
+def _warpy(q: torch.Tensor, feature: str = "attn_fwd_fp8") -> bool:
+    return (
+        _dispatch.arch(q.device).startswith("sm")
+        and warpy.supports(feature, q.device)
+        and warpy.fits_attention(q)
+    )
+
+
+def _warpy_bf16(q: torch.Tensor, grad: bool) -> bool:
+    features = ("attn_fwd", "attn_bwd") if grad else ("attn_fwd",)
+    return (
+        _dispatch.arch(q.device).startswith("sm")
+        and all(warpy.supports(f, q.device) for f in features)
+        and warpy.fits_attention_bf16(q)
+    )
 
 
 def _ctx_scale(out: torch.Tensor, lse: torch.Tensor, ln_pad: torch.Tensor):
@@ -55,6 +68,9 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor
     """
     if _flash(q):
         return flash_attn.attention(q, k, v).flatten(2)
+    grad = torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v))
+    if _warpy_bf16(q, grad):
+        return warpy.attention_bf16(q, k, v).flatten(2)
     return reference.attention(q, k, v).flatten(2)
 
 
@@ -107,7 +123,7 @@ def attention_fp8_grad(
     Raises:
         RuntimeError: If ``q`` is not on a CUDA device.
     """
-    if _warpy(q):
+    if _warpy(q, "attn_bwd_fp8"):
         return warpy.attention_grad(q, k, v, q_scale, k_scale).flatten(2)
     return attention(q, k, v)
 
@@ -177,6 +193,8 @@ def cross_attention_trimmed(
         out, lse = warpy.attention_trimmed(q, k, v, seqused_k, rescale)
     elif _flash(q):
         out, lse = flash_attn.attention_trimmed(q, k, v, seqused_k)
+    elif _warpy_bf16(q, False):
+        out, lse = warpy.attention_trimmed_bf16(q, k, v, seqused_k)
     elif _dispatch.arch(q.device) == "reference":
         out, lse = reference.attention_trimmed(q, k, v, seqused_k)
     else:
@@ -258,8 +276,11 @@ def warmup(
     device: torch.device,
     tune: bool = True,
     verbose: bool = False,
+    backward: bool = False,
 ) -> bool:
-    """Prepare the FP8 attention kernel for one shape, tuning it if no saved result exists.
+    """Prepare the attention kernels for one shape, tuning them if no saved result exists.
+
+    This covers bf16 attention, and FP8 attention where the GPU has it.
 
     Args:
         batch: Batch size.
@@ -270,17 +291,44 @@ def warmup(
         device: CUDA device the attention will run on.
         tune: Whether to tune the shape if no saved result exists for it.
         verbose: Whether to print progress while tuning.
+        backward: Whether to also tune the backward kernels, for training.
 
     Returns:
-        True if a kernel was prepared, False if this GPU has no FP8 attention kernel.
+        True if a kernel was prepared, False if this GPU needs no preparation.
 
     Raises:
         RuntimeError: If ``device`` is not a CUDA device.
     """
-    probe = torch.empty(0, 0, heads, head_dim, device=device)
-    if not _warpy(probe):
-        return False
-    warpy.warmup_attention(
-        batch, heads, q_len, k_len, head_dim, device, False, tune, verbose
-    )
-    return True
+    probe = torch.empty(0, 0, heads, head_dim, dtype=torch.bfloat16, device=device)
+    done = False
+    trimmed = k_len != q_len
+    if not _flash(probe) and _warpy_bf16(probe, backward and not trimmed):
+        warpy.warmup_attention(
+            batch,
+            heads,
+            q_len,
+            k_len,
+            head_dim,
+            device,
+            trimmed,
+            tune,
+            verbose,
+            True,
+            backward,
+        )
+        done = True
+    if _warpy(probe):
+        warpy.warmup_attention(
+            batch,
+            heads,
+            q_len,
+            k_len,
+            head_dim,
+            device,
+            False,
+            tune,
+            verbose,
+            backward=backward and _warpy(probe, "attn_bwd_fp8"),
+        )
+        done = True
+    return done

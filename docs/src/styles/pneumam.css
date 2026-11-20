@@ -1,0 +1,70 @@
+/* Pneumam's look on Starlight: near-black, cool blue, Mona Sans, JetBrains Mono (the landing page's tokens). */
+:root,
+:root[data-theme='dark'] {
+	--sl-font: 'Mona Sans', system-ui, sans-serif;
+	--sl-font-mono: 'JetBrains Mono', ui-monospace, monospace;
+	--sl-color-accent-low: #142246;
+	--sl-color-accent: #6b9bff;
+	--sl-color-accent-high: #c9dbff;
+	--sl-color-white: #f1f3f7;
+	--sl-color-gray-1: #e2e5eb;
+	--sl-color-gray-2: #c7cedb;
+	--sl-color-gray-3: #9aa1ae;
+	--sl-color-gray-4: #5d6370;
+	--sl-color-gray-5: #22252f;
+	--sl-color-gray-6: #13151c;
+	--sl-color-black: #0a0b0f;
+	--sl-color-bg-nav: rgb(10 11 15 / 0.88);
+	--sl-color-bg-sidebar: #0a0b0f;
+	--sl-color-hairline: #22252f;
+	--sl-color-hairline-light: #22252f;
+}
+/* light mode keeps the same blue on a cool white */
+:root[data-theme='light'] {
+	--sl-color-accent-low: #dfe8ff;
+	--sl-color-accent: #2f5fd6;
+	--sl-color-accent-high: #142246;
+}
+
+/* headings in the display face, as on the landing page */
+.sl-markdown-content :is(h2, h3), h1#_top {
+	font-stretch: 104%;
+	letter-spacing: -0.02em;
+	font-weight: 500;
+}
+h1#_top { letter-spacing: -0.035em; }
+
+/* the landing page's ruled grid, as a fading band behind each page title */
+.content-panel:first-of-type { position: relative; }
+.content-panel:first-of-type::before {
+	content: '';
+	position: absolute;
+	inset: 0 0 auto;
+	height: 260px;
+	z-index: -1;
+	pointer-events: none;
+	background-image: linear-gradient(var(--sl-color-hairline) 1px, transparent 1px),
+		linear-gradient(90deg, var(--sl-color-hairline) 1px, transparent 1px);
+	background-size: 48px 48px;
+	-webkit-mask-image: linear-gradient(to bottom, #000, transparent);
+	mask-image: linear-gradient(to bottom, #000, transparent);
+	opacity: 0.7;
+}
+
+/* tables in a frame, flag names in the code blue */
+.sl-markdown-content table { border: 1px solid var(--sl-color-hairline); border-radius: 6px; overflow: hidden; display: table; width: 100%; }
+.sl-markdown-content th { background: var(--sl-color-gray-6); font-weight: 600; }
+.sl-markdown-content td:first-child code { background: none; border: 0; padding: 0; color: #7fb4ff; white-space: nowrap; }
+:root[data-theme='light'] .sl-markdown-content td:first-child code { color: #2f5fd6; }
+
+/* the red star from the landing page on notes */
+.starlight-aside--note .starlight-aside__title::after { content: ' *'; color: #ff6b5b; }
+
+/* the landing page's solid blue button and quieter surfaces */
+:root[data-theme='dark'] .sl-link-button.primary { background: #6b9bff; border-color: #6b9bff; color: #0a0b0f; }
+:root[data-theme='dark'] .sl-link-button.primary:hover { background: #86adff; }
+:root[data-theme='dark'] .sidebar-content a[aria-current='page'] { background: var(--sl-color-accent-low); color: var(--sl-color-white); font-weight: 600; box-shadow: inset 2px 0 #6b9bff; }
+:root[data-theme='dark'] .starlight-aside--note { background: #13151c; border-color: #6b9bff; }
+:root[data-theme='dark'] .starlight-aside--tip { background: #13151c; }
+:root[data-theme='dark'] .starlight-aside--caution { background: #13151c; }
+.sl-markdown-content :is(th, td) { padding: 0.7rem 1rem; }

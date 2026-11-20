@@ -1,0 +1,69 @@
+---
+title: Command line
+description: Generate images with scripts/generate.py.
+sidebar:
+  order: 1
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+`scripts/generate.py` generates images and saves each one as `<seed>.png`. It needs the `cli` extra.
+
+<Tabs syncKey="os">
+<TabItem label="Linux">
+
+```bash
+python scripts/generate.py \
+  --checkpoint checkpoints/anima.safetensors \
+  --vae checkpoints/wan21-vae.safetensors \
+  --prompt "a lighthouse at dusk" \
+  --seed 0 --count 4 --fp8
+```
+
+</TabItem>
+<TabItem label="Windows">
+
+```powershell
+python scripts\generate.py `
+  --checkpoint checkpoints\anima.safetensors `
+  --vae checkpoints\wan21-vae.safetensors `
+  --prompt "a lighthouse at dusk" `
+  --seed 0 --count 4 --fp8
+```
+
+</TabItem>
+</Tabs>
+
+The first image at a new size takes a few seconds longer than the rest. Every image after it runs at full speed.
+
+## Model options
+
+| Flag | What it does |
+|---|---|
+| `--checkpoint` | Points to the converted model. This flag is required. |
+| `--vae` | Points to the converted decoder. |
+| `--lora PATH[:STRENGTH]` | Adds a LoRA at an optional strength. Repeat the flag to stack several. |
+| `--repo` | Chooses where the text encoder is downloaded from. The default is `circlestone-labs/Anima-Base-v1.0-Diffusers`. |
+
+## Image options
+
+| Flag | What it does |
+|---|---|
+| `--prompt` | Describes what to draw. |
+| `--negative` | Describes what to avoid. |
+| `--width`, `--height` | Set the image size. Both default to 1024. |
+| `--steps` | Sets the number of sampling steps. The default is 30. |
+| `--cfg` | Sets the guidance scale. The default is 4.0, and 1 turns guidance off. |
+| `--sampler` | Chooses `euler` or `er_sde`. [Samplers and guidance](/generate/sampling/) explains the difference. |
+| `--seed` | Sets the first seed. Each further image uses the next seed. |
+| `--count` | Sets how many images to make. |
+| `--batch` | Sets how many images are made at once. |
+| `--out` | Sets the output folder. The default is `generate_out`. |
+
+## Speed options
+
+| Flag | What it does |
+|---|---|
+| `--fp8` | Turns on FP8, which makes generation about twice as fast. |
+| `--no-graph` | Turns off the speed-up that makes later images faster than the first. It is on by default. |
+| `--tune` | Tunes Pneumam for your GPU before the first image. The first time for each image size it takes from under a minute to about five minutes, depending on the GPU. The results are saved, so later runs skip it. |

@@ -1,0 +1,28 @@
+---
+title: Speed
+description: How fast Pneumam generates images, and how to get the best speed.
+sidebar:
+  order: 3
+---
+
+import SpeedChart from '../../../components/SpeedChart.astro';
+
+<SpeedChart
+	caption="Seconds per image on an RTX 5090, at 1024×1024 with 30 Euler steps and guidance 4"
+	rows={[
+		{ label: "ComfyUI's Anima, bf16", seconds: 6.2 },
+		{ label: 'Pneumam, bf16', seconds: 5.2 },
+		{ label: 'Pneumam, FP8', seconds: 3.1, highlight: true },
+		{ label: 'Pneumam, FP8 with LLLite', seconds: 3.2, highlight: true },
+		{ label: 'Pneumam, FP8 with FP8 attention', seconds: 2.4, highlight: true },
+	]}
+/>
+
+Times exclude the first image. The first image at a new size takes a few seconds longer while Pneumam prepares for that size.
+
+## Get the best speed
+
+- Turn on FP8. It makes each image about twice as fast. In ComfyUI it is the `fp8` switch on Load Pneumam Model, and on the command line it is `--fp8`.
+- Keep image sizes the same between runs, so you only wait for the first image once.
+- Stay near 1024×1024 in total area, such as 832×1216 or 1216×832. Anima also draws best at these sizes.
+- Use an RTX 50 series card, which is where Pneumam is fastest.

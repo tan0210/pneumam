@@ -2166,6 +2166,16 @@ sm120 = [
     { name = "triton-windows", marker = "sys_platform == 'win32'" },
     { name = "warpy-kernels" },
 ]
+sm86 = [
+    { name = "triton", marker = "sys_platform != 'win32'" },
+    { name = "triton-windows", marker = "sys_platform == 'win32'" },
+    { name = "warpy-kernels" },
+]
+sm89 = [
+    { name = "triton", marker = "sys_platform != 'win32'" },
+    { name = "triton-windows", marker = "sys_platform == 'win32'" },
+    { name = "warpy-kernels" },
+]
 sm90 = [
     { name = "flash-attn-4", marker = "sys_platform != 'win32'" },
     { name = "quack-kernels", extra = ["cu13"] },
@@ -2222,6 +2232,8 @@ requires-dist = [
     { name = "pneumam", extras = ["convert", "hub"], marker = "extra == 'comfyui'" },
     { name = "pneumam", extras = ["text"], marker = "extra == 'convert'" },
     { name = "pneumam", extras = ["triton"], marker = "extra == 'sm120'" },
+    { name = "pneumam", extras = ["triton"], marker = "extra == 'sm86'" },
+    { name = "pneumam", extras = ["triton"], marker = "extra == 'sm89'" },
     { name = "pneumam", extras = ["triton"], marker = "extra == 'sm90'" },
     { name = "psutil", marker = "extra == 'comfyui'" },
     { name = "pydantic", marker = "extra == 'comfyui'", specifier = "~=2.0" },
@@ -2245,9 +2257,11 @@ requires-dist = [
     { name = "triton", marker = "sys_platform == 'linux' and extra == 'triton'", specifier = ">=3.3" },
     { name = "triton-windows", marker = "sys_platform == 'win32' and extra == 'triton'", specifier = ">=3.3" },
     { name = "warpy-kernels", marker = "extra == 'sm120'", git = "https://github.com/tan0210/warpy-kernels" },
+    { name = "warpy-kernels", marker = "extra == 'sm86'", git = "https://github.com/tan0210/warpy-kernels" },
+    { name = "warpy-kernels", marker = "extra == 'sm89'", git = "https://github.com/tan0210/warpy-kernels" },
     { name = "yarl", marker = "extra == 'comfyui'", specifier = ">=1.18.0" },
 ]
-provides-extras = ["triton", "sm90", "sm120", "vae", "text", "convert", "hub", "comfyui", "cli", "train", "bench"]
+provides-extras = ["triton", "sm90", "sm86", "sm89", "sm120", "vae", "text", "convert", "hub", "comfyui", "cli", "train", "bench"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -3361,8 +3375,9 @@ wheels = [
 [[package]]
 name = "warpy-kernels"
 version = "0.1.0"
-source = { git = "https://github.com/tan0210/warpy-kernels#df385c6e3fcec44cffef096bbc0f37ed17f0f6a2" }
+source = { git = "https://github.com/tan0210/warpy-kernels#3ea3df29ed2e256b9bce7e02f6c3cd0ec888f9ab" }
 dependencies = [
+    { name = "apache-tvm-ffi" },
     { name = "nvidia-cutlass-dsl" },
     { name = "torch" },
 ]

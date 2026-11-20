@@ -10,6 +10,7 @@ from .gemm import (
     fp8_dgelu_addmm_,
     fp8_gelu_addmm_,
     gelu_addmm_,
+    mx_supported,
     rowquant,
 )
 
@@ -254,8 +255,10 @@ def _lora_mlp(
         post, pre = gelu_addmm_(update1, x, w1)
     else:
         q, s = rowquant(x[None])
-        # with both layers in FP8 the GELU output goes to the second one as MXFP8
-        res = fp8_gelu_addmm_(update1, q[0], s, up8, down8 is not None)
+        # with both layers in FP8 the GELU output goes to the second one as MXFP8 where it is fast
+        res = fp8_gelu_addmm_(
+            update1, q[0], s, up8, down8 is not None and mx_supported(x.device)
+        )
         post, pre, *rest = cast(tuple[torch.Tensor, ...], res)
         mx = tuple(rest)
     low2 = post @ a2.T
@@ -309,8 +312,8 @@ def _bwd_lora_mlp(ctx, g, *unused):
         dpre = dgelu_addmm_(dlow2 @ a2, g, w2, pre)
     else:
         gq, gs = rowquant(g[None])
-        mx = need[0] and up8 is not None
-        # with both backward products in FP8 the gradient goes to the first layer as MXFP8
+        mx = need[0] and up8 is not None and mx_supported(g.device)
+        # with both backward products in FP8 the gradient goes to the first layer as MXFP8 where it is fast
         res = fp8_dgelu_addmm_(dlow2 @ a2, gq[0], gs, down8, pre, mx)
         if mx:
             dpre, *rest = cast(tuple[torch.Tensor, ...], res)

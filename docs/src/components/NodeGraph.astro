@@ -1,0 +1,98 @@
+---
+// The minimal ComfyUI graph, laid out as ComfyUI draws one: inputs on a node's left edge, outputs on
+// its right, settings under the sockets. Columns are placed so every wire runs through the gap
+// between two columns and never crosses a node.
+type Node = { id: string; title: string; x: number; y: number; w?: number; inputs?: string[]; outputs?: string[]; widgets?: [string, string][]; optional?: boolean };
+
+const HEAD = 32, ROW = 24, PAD = 8, W = 196;
+const nodes: Node[] = [
+	{ id: 'model', title: 'Load Pneumam Model', x: 20, y: 20, outputs: ['MODEL'], widgets: [['fp8', 'on'], ['cuda_graphs', 'on']] },
+	{ id: 'text', title: 'Load Pneumam Text Encoder', x: 20, y: 176, outputs: ['ENCODER'] },
+	{ id: 'lora', title: 'Pneumam LoRA', x: 256, y: 20, inputs: ['model'], outputs: ['MODEL'], widgets: [['strength', '0.8']], optional: true },
+	{ id: 'pos', title: 'Pneumam Text Encode', x: 256, y: 136, inputs: ['encoder'], outputs: ['positive'], widgets: [['length', '512']] },
+	{ id: 'neg', title: 'Pneumam Text Encode', x: 256, y: 250, inputs: ['encoder'], outputs: ['negative'], widgets: [['length', '512']] },
+	{ id: 'latent', title: 'Empty Latent Image', x: 256, y: 364, outputs: ['LATENT'], widgets: [['width', '1024'], ['height', '1024']] },
+	{ id: 'ks', title: 'KSampler', x: 492, y: 20, inputs: ['model', 'positive', 'negative', 'latent_image'], outputs: ['LATENT'], widgets: [['steps', '30'], ['cfg', '4.0'], ['sampler', 'euler'], ['scheduler', 'simple']] },
+	{ id: 'vae', title: 'Load Pneumam VAE', x: 492, y: 300, outputs: ['VAE'] },
+	{ id: 'dec', title: 'Pneumam VAE Decode', x: 728, y: 20, inputs: ['samples', 'vae'], outputs: ['IMAGE'] },
+	{ id: 'save', title: 'Save Image', x: 728, y: 156, inputs: ['images'] },
+];
+// [from node, output index, to node, input index]
+const links: [string, number, string, number][] = [
+	['model', 0, 'lora', 0], ['lora', 0, 'ks', 0],
+	['text', 0, 'pos', 0], ['text', 0, 'neg', 0],
+	['pos', 0, 'ks', 1], ['neg', 0, 'ks', 2], ['latent', 0, 'ks', 3],
+	['ks', 0, 'dec', 0], ['vae', 0, 'dec', 1], ['dec', 0, 'save', 0],
+];
+
+const by = (id: string) => nodes.find((n) => n.id === id)!;
+const width = (n: Node) => n.w ?? W;
+const slots = (n: Node) => Math.max(n.inputs?.length ?? 0, n.outputs?.length ?? 0);
+const height = (n: Node) => HEAD + (slots(n) + (n.widgets?.length ?? 0)) * ROW + PAD;
+const socketY = (n: Node, i: number) => n.y + HEAD + i * ROW + ROW / 2;
+const path = ([a, o, b, i]: (typeof links)[number]) => {
+	const A = by(a), B = by(b);
+	const x1 = A.x + width(A), y1 = socketY(A, o), x2 = B.x, y2 = socketY(B, i);
+	// a target in the same column, below the source: go out right, down past the source, back left, in from the left
+	if (x2 <= A.x) {
+		const below = A.y + height(A) + 20, r = 8;
+		return `M${x1} ${y1} H${x1 + 20 - r} Q${x1 + 20} ${y1} ${x1 + 20} ${y1 + r} V${below - r} Q${x1 + 20} ${below} ${x1 + 20 - r} ${below} H${x2 - 20 + r} Q${x2 - 20} ${below} ${x2 - 20} ${below + r} V${y2 - r} Q${x2 - 20} ${y2} ${x2 - 20 + r} ${y2} H${x2}`;
+	}
+	const d = Math.max(30, (x2 - x1) / 2);
+	return `M${x1} ${y1} C${x1 + d} ${y1} ${x2 - d} ${y2} ${x2} ${y2}`;
+};
+const canvasW = Math.max(...nodes.map((n) => n.x + width(n))) + 40;
+const canvasH = Math.max(...nodes.map((n) => n.y + height(n))) + 20;
+---
+<figure class="graph not-content">
+	<div class="graph__scroll" tabindex="0" aria-label="The graph scrolls sideways on narrow screens">
+	<svg viewBox={`0 0 ${canvasW} ${canvasH}`} role="img" aria-label="Load Pneumam Model feeds Pneumam LoRA, which feeds KSampler's model input. Load Pneumam Text Encoder feeds two Pneumam Text Encode nodes, which feed KSampler's positive and negative inputs. Empty Latent Image feeds latent_image. KSampler and Load Pneumam VAE feed Pneumam VAE Decode, which feeds Save Image.">
+		<defs>
+			<pattern id="ng-dots" width="20" height="20" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" class="dot" /></pattern>
+		</defs>
+		<rect width={canvasW} height={canvasH} fill="url(#ng-dots)" />
+		{links.map((l) => <path class="wire" d={path(l)} />)}
+		{nodes.map((n) => {
+			const w = width(n), h = height(n);
+			return (
+				<g transform={`translate(${n.x} ${n.y})`}>
+					<rect class:list={["box", { optional: n.optional }]} width={w} height={h} rx="6" />
+					<text class="title" x="10" y="21">{n.title}</text>
+					<line class="rule" x1="0" x2={w} y1={HEAD} y2={HEAD} />
+					{Array.from({ length: slots(n) }, (_, i) => {
+						const y = HEAD + i * ROW + ROW / 2;
+						return (
+							<>
+								{n.inputs?.[i] && <><circle class="socket" cx="0" cy={y} r="4" /><text class="slot" x="10" y={y + 4}>{n.inputs[i]}</text></>}
+								{n.outputs?.[i] && <><circle class="socket" cx={w} cy={y} r="4" /><text class="slot" x={w - 10} y={y + 4} text-anchor="end">{n.outputs[i]}</text></>}
+							</>
+						);
+					})}
+					{n.widgets?.map(([k, v], j) => {
+						const y = HEAD + (slots(n) + j) * ROW + ROW / 2 + 4;
+						return <><text class="key" x="14" y={y}>{k}</text><text class="val" x={w - 14} y={y} text-anchor="end">{v}</text></>;
+					})}
+				</g>
+			);
+		})}
+	</svg>
+	</div>
+</figure>
+
+<style>
+	.graph { margin: 1.5rem 0; border: 1px solid var(--sl-color-hairline); border-radius: 8px; background: #0d0f15; overflow: hidden; }
+	.graph__scroll { overflow-x: auto; }
+	.graph__scroll:focus-visible { outline: 2px solid var(--sl-color-accent); outline-offset: -2px; }
+	svg { display: block; width: 100%; min-width: 680px; height: auto; }
+	.dot { fill: color-mix(in srgb, var(--sl-color-white) 12%, transparent); }
+	.wire { fill: none; stroke: var(--sl-color-accent); stroke-width: 2; opacity: 0.8; }
+	.box { fill: var(--sl-color-gray-6); stroke: var(--sl-color-hairline); }
+	.box.optional { stroke: var(--sl-color-gray-3); stroke-dasharray: 5 4; }
+	.rule { stroke: var(--sl-color-hairline); }
+	.socket { fill: var(--sl-color-accent); }
+	text { font-family: var(--sl-font-mono); font-size: 14px; }
+	.title { font-family: var(--sl-font); font-size: 14px; font-weight: 600; fill: var(--sl-color-white); }
+	.slot { fill: var(--sl-color-gray-2); }
+	.key { fill: var(--sl-color-gray-3); }
+	.val { fill: var(--sl-color-white); font-weight: 500; }
+</style>

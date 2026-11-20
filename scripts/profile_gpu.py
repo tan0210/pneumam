@@ -37,6 +37,18 @@ def heading(title: str) -> None:
     print(f"\n{title}\n{'-' * len(title)}")
 
 
+def modes(device: torch.device) -> tuple[str, ...]:
+    """List the ``MODES`` a GPU can run.
+
+    Args:
+        device: The GPU.
+
+    Returns:
+        ``MODES``, or only ``"bf16"`` if the GPU has no FP8 matrix multiplication.
+    """
+    return MODES if gemm.fp8_supported(device) else MODES[:1]
+
+
 def attempt(label: str, fn: Callable[[], Any]) -> Any:
     """Run one measurement, recording a failure instead of raising.
 
@@ -251,6 +263,7 @@ def check(args: argparse.Namespace, model: AnimaDiT) -> list[dict[str, Any]]:
         for m in MODES
         for p in ("reference", "triton", None)
         for tr in (False, True)
+        if m in modes(device) or p == "reference"
     ]
     for mode, path, trim in cases:
         if mode != "bf16" and path == "triton":
@@ -289,7 +302,7 @@ def graph_check(args: argparse.Namespace, model: AnimaDiT) -> list[dict[str, Any
     text = make_text(args, model, 2)
     sg = sigmas(args.steps, model.spec.shift).to(device)
     rows = []
-    for mode in MODES:
+    for mode in modes(device):
 
         def run(mode=mode):
             rt = runtime(model, mode)
@@ -327,7 +340,7 @@ def steps(
     text = make_text(args, model, 2 * B)
     sg = sigmas(args.steps, model.spec.shift).to(device)
     rows = []
-    for mode in MODES:
+    for mode in modes(device):
         for trim in (True, False):
             for graph in (False, True):
                 label = f"step {width}x{height} {mode} trim={trim} graph={graph}"
@@ -427,7 +440,9 @@ def ops(
         ("bf16", "cross-attention untrimmed", 0, lambda: ctx_full.attend(0, xq)),
         ("bf16", "mlp", 1, lambda: gemm.mlp(hid, b.up.weight, b.down.weight)),
     ]
-    fp8 = attempt("ops: quantize block 0", lambda: runtime(model, "fp8"))
+    fp8 = None
+    if "fp8" in modes(z.device):
+        fp8 = attempt("ops: quantize block 0", lambda: runtime(model, "fp8"))
     if fp8 is not None and fp8.fp8 is not None and fp8.fp8_scales is not None:
         w, s = fp8.fp8[0], fp8.fp8_scales[0]
         hq, hs = adaln.adaln_fp8(z, shift, scale)
@@ -522,7 +537,7 @@ def ops(
             print(
                 f"  {mode:9s} {name:36s} {r['ms']:8.3f} ms  x{count} x{c.layers} = {per_eval:8.2f} ms"
             )
-    for mode in ("bf16", "fp8"):
+    for mode in modes(z.device)[:2]:
         total = sum(r["ms_per_eval"] for r in rows if r["mode"] == mode)
         print(f"  {mode}: ops sum to {total:.1f} ms per evaluation")
     return rows
@@ -546,11 +561,17 @@ def tune(
     batches = sorted({2 * args.batch, 1, *args.train_batches})
     for width, height in sizes:
         for batch in batches:
-            for mode in ("bf16", "fp8"):
+            for mode in modes(model.patch.weight.device)[:2]:
                 rt = runtime(model, mode)
                 t0 = time.perf_counter()
                 n = fused.warmup(
-                    model, rt, height // 8, width // 8, batch, args.ctx_len
+                    model,
+                    rt,
+                    height // 8,
+                    width // 8,
+                    batch,
+                    args.ctx_len,
+                    backward=batch in args.train_batches,
                 )
                 seconds = time.perf_counter() - t0
                 rows.append(
@@ -644,6 +665,8 @@ def train(
         add("inference forward, adapter attached", infer)
         reference = None
         for name, base, backward, attn in TRAIN_VARIANTS:
+            if base and "fp8" not in modes(model.patch.weight.device):
+                continue
             if base:
                 L.enable_fp8_base(model, backward)
             else:
@@ -740,7 +763,7 @@ def trace(
     text = make_text(args, model, 2 * args.batch)
     sg = sigmas(args.steps, model.spec.shift).to(device)
     tables = {}
-    for mode in MODES:
+    for mode in modes(device):
 
         def run(mode=mode):
             rt = runtime(model, mode)

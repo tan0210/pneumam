@@ -39,7 +39,7 @@ python scripts/convert.py --out checkpoints
 
 This writes `checkpoints/anima.safetensors` and `checkpoints/wan21-vae.safetensors`. Put them in ComfyUI's `models/diffusion_models` and `models/vae` folders. The text encoder is downloaded from Hugging Face on first use.
 
-LoRA files go in `models/loras`. LLLite files, such as [kohya-ss/Anima-LLLite](https://huggingface.co/kohya-ss/Anima-LLLite), go in `models/model_patches`.
+LoRA files go in `models/loras`. LLLite files, such as [kohya-ss/Anima-LLLite](https://huggingface.co/kohya-ss/Anima-LLLite), go in `models/model_patches`. If you replace a LoRA or LLLite file under the same name, for example with a newer training epoch, the next run uses the new file without restarting ComfyUI.
 
 ## Nodes
 

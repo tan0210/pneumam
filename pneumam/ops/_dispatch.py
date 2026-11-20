@@ -17,6 +17,8 @@ def _probe(device: torch.device) -> str:
         return "sm90"
     if (major, minor) == (8, 9):
         return "sm89"
+    if (major, minor) == (8, 6):
+        return "sm86"
     if major == 8:
         return "sm80"
     return "other"
@@ -30,7 +32,7 @@ def arch(device: torch.device) -> str:
 
     Returns:
         The path pinned by ``force`` if there is one. Otherwise the GPU generation: ``"sm80"``,
-        ``"sm89"``, ``"sm90"``, ``"sm100"``, ``"sm120"``, or ``"other"`` for older GPUs.
+        ``"sm86"``, ``"sm89"``, ``"sm90"``, ``"sm100"``, ``"sm120"``, or ``"other"`` for older GPUs.
 
     Raises:
         RuntimeError: If no path is pinned and ``device`` is not a CUDA device.

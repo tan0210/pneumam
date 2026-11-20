@@ -1,4 +1,5 @@
 # pyright: reportMissingImports=false
+import os
 from typing import Any, ClassVar, cast
 
 import comfy.conds
@@ -26,6 +27,31 @@ from pneumam.runtime import Runtime
 
 LORAS = "pneumam_loras"
 LLLITE = "pneumam_lllite"
+
+
+def file_stamp(path: str) -> tuple[int, int]:
+    """Identify the current contents of a file.
+
+    A file replaced under the same name gets a new stamp, so it counts as a new adapter.
+
+    Args:
+        path: The file.
+
+    Returns:
+        ``(modification time in ns, size in bytes)``.
+    """
+    st = os.stat(path)
+    return st.st_mtime_ns, st.st_size
+
+
+def _percent_to_sigma(percent: float, shift: float) -> float:
+    # ComfyUI's flow percent_to_sigma, with Pneumam's schedule shift
+    if percent <= 0.0:
+        return 1.0
+    if percent >= 1.0:
+        return 0.0
+    t = 1.0 - percent
+    return shift * t / (1 + (shift - 1) * t)
 
 
 def read_adapter(path: str) -> dict[str, torch.Tensor]:
@@ -83,9 +109,9 @@ class Denoiser(nn.Module):
         self._where: int | None = None
         self._loras: tuple = ()
         self._backup: dict[str, torch.Tensor] | None = None
-        self._adapters: dict[str, dict[str, torch.Tensor]] = {}
-        self._lllites: dict[str, LLLite] = {}
-        self._lllite_path: str | None = None
+        self._adapters: dict[tuple, dict[str, torch.Tensor]] = {}
+        self._lllite: LLLite | None = None
+        self._lllite_id: tuple | None = None
         self._control: Control | None = None
         self._control_key: tuple | None = None
         self._spec: dict | None = None
@@ -125,30 +151,38 @@ class Denoiser(nn.Module):
         self._sync_loras(tuple(options.get(LORAS, ())))
         self._sync_lllite(options.get(LLLITE), height, width)
 
-    def gate(self, sigma: float) -> None:
+    def gate(self, sigma: float, shift: float | None = None) -> None:
         """Switch the LLLite control on or off for a step.
 
         Args:
             sigma: Noise level of the step.
+            shift: Schedule shift of a sampler that builds its own schedule, so the control's
+                start and end percentages map to that schedule. None uses the sigmas ComfyUI
+                computed from the model's sampling settings.
         """
         spec = self._spec
-        if spec is not None and self._control is not None:
-            on = spec["sigma_end"] <= sigma <= spec["sigma_start"]
-            self._control.set_strength(spec["strength"] if on else 0.0)
+        if spec is None or self._control is None:
+            return
+        if shift is None:
+            start, end = spec["sigma_start"], spec["sigma_end"]
+        else:
+            start = _percent_to_sigma(spec["start_percent"], shift)
+            end = _percent_to_sigma(spec["end_percent"], shift)
+        on = end <= sigma <= start
+        self._control.set_strength(spec["strength"] if on else 0.0)
 
     def _sync_lllite(self, spec: dict | None, height: int, width: int) -> None:
         self._spec = spec
-        path = None if spec is None else spec["path"]
-        if path != self._lllite_path:
-            if self._lllite_path is not None:
+        ident = None if spec is None else (spec["path"], spec["stamp"])
+        if ident != self._lllite_id:
+            if self._lllite_id is not None:
                 detach_lllite(self.dit)
-                self._control = self._control_key = None
-            if path is not None:
-                if path not in self._lllites:
-                    device = self.dit.patch.weight.device
-                    self._lllites[path] = load_lllite(path, device, self.dtype)
-                self._control = attach_lllite(self.dit, self._lllites[path])
-            self._lllite_path = path
+                self._lllite = self._control = self._control_key = None
+            if spec is not None:
+                device = self.dit.patch.weight.device
+                self._lllite = load_lllite(spec["path"], device, self.dtype)
+                self._control = attach_lllite(self.dit, self._lllite)
+            self._lllite_id = ident
             self._reset()
         if spec is None:
             return
@@ -161,7 +195,7 @@ class Denoiser(nn.Module):
             and old[2:] == key[2:]
         ):
             return  # the same tensors, kept alive here, so the cached embedding still fits
-        lllite = self._lllites[spec["path"]]
+        lllite = cast(LLLite, self._lllite)
         size = (width * 8, height * 8)
         image = spec["image"][..., :3].movedim(-1, 1)
         image = comfy.utils.common_upscale(image, *size, "bicubic", crop="center")
@@ -182,11 +216,12 @@ class Denoiser(nn.Module):
     def _sync_loras(self, loras: tuple) -> None:
         if loras == self._loras:
             return
-        for path, _ in loras:
-            if path not in self._adapters:
-                self._adapters[path] = read_adapter(path)
+        used = {(path, stamp) for path, _, stamp in loras}
+        self._adapters = {k: v for k, v in self._adapters.items() if k in used}
+        for path, stamp in used - set(self._adapters):
+            self._adapters[path, stamp] = read_adapter(path)
         if loras or self._backup:
-            pairs = [(self._adapters[path], strength) for path, strength in loras]
+            pairs = [(self._adapters[p, st], strength) for p, strength, st in loras]
             self._backup = merge_lora(self.dit, pairs, self._backup)
         if self.rt.fp8 is not None:
             fused.enable_fp8(

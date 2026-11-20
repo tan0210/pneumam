@@ -1,0 +1,87 @@
+---
+title: Training
+description: Train LoRA and LLLite adapters on one GPU or several.
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+The training scripts in `examples/` train LoRA and LLLite adapters from a folder of images and captions. They need the `train` extra and the files from [Convert checkpoints](/start/convert/).
+
+<Tabs syncKey="os">
+<TabItem label="Linux">
+
+```bash
+python examples/train-lora.py \
+  --model checkpoints/anima.safetensors \
+  --vae checkpoints/wan21-vae.safetensors \
+  --datasets examples/dataset.toml \
+  --prompts examples/prompts.txt \
+  --out runs/mychar --fp8 --graph
+```
+
+</TabItem>
+<TabItem label="Windows">
+
+```powershell
+python examples\train-lora.py `
+  --model checkpoints\anima.safetensors `
+  --vae checkpoints\wan21-vae.safetensors `
+  --datasets examples\dataset.toml `
+  --prompts examples\prompts.txt `
+  --out runs\mychar --fp8 --graph
+```
+
+</TabItem>
+</Tabs>
+
+To train on several GPUs, start the same command with torchrun:
+
+```bash
+torchrun --nproc-per-node 4 examples/train-lora.py --model ...
+```
+
+## What a run saves
+
+Everything goes into the folder you pass to `--out`. The run saves the adapter every `--save-every` steps and again at the end. It also writes preview images for the prompts in `--prompts` into `previews/`.
+
+A run can resume where it stopped. Run the same command with the same `--out`, and training continues from the last save.
+
+LoRAs are saved with ComfyUI's naming and LLLite models in kohya's format, so both load in stock ComfyUI and in the Pneumam nodes.
+
+## LoRA options
+
+| Flag | What it does |
+|---|---|
+| `--steps` | Sets how many steps to train. The default is 2000. |
+| `--rank` | Sets the LoRA's size. The default is 16. |
+| `--batch`, `--lr` | Set the batch size and the learning rate. |
+| `--fp8` | Turns on FP8 to train faster. |
+| `--graph` | Turns on the speed-up for repeated steps. |
+| `--wandb` | Logs the run to Weights & Biases. |
+
+## LLLite options
+
+`examples/train-lllite.py` takes the same `--model`, `--vae` and `--datasets` flags. `--inpainting` trains an inpainting model, and `--targets` chooses which parts of the model it attaches to. It trains for 4000 steps by default.
+
+## The dataset file
+
+The dataset file uses the TOML format from kohya's sd-scripts. Each subset points to a folder of images with a caption file next to each image.
+
+```toml
+[general]
+
+[[datasets]]
+resolution = 1024
+bucket_reso_steps = 64
+
+  [[datasets.subsets]]
+  image_dir = "data/mychar"
+  num_repeats = 1
+  caption_prefix = "mychar, "
+  shuffle_caption = true
+  keep_tokens = 1
+  flip_aug = false
+  # conditioning_data_dir = "data/mychar-control"   # control images for LLLite
+```
